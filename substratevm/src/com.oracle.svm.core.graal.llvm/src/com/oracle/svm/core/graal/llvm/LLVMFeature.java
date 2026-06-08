@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -136,6 +136,29 @@ public class LLVMFeature implements InternalFeature {
     public void beforeAnalysis(BeforeAnalysisAccess access) {
         FeatureImpl.BeforeAnalysisAccessImpl accessImpl = (FeatureImpl.BeforeAnalysisAccessImpl) access;
         accessImpl.registerAsRoot((AnalysisMethod) LLVMExceptionUnwind.getRetrieveExceptionMethod(accessImpl.getMetaAccess()), true, "LLVM exception unwind, registered in " + LLVMFeature.class);
+    }
+
+    @Override
+    public void beforeCompilation(BeforeCompilationAccess access) {
+        /*
+         * Pre-assign each HostedMethod a deterministic patchpoint-id base so
+         * that the per-function LLVM bitcode is byte-identical across builds.
+         *
+         * Before this hook existed, LLVMGenerator allocated patchpoint ids
+         * from a single process-wide AtomicLong incremented from inside the
+         * parallel compile queue.  Whichever thread reached an emitInvoke
+         * first got the lower id, so the same call site received different
+         * ids on different runs and the bitcode bytes diverged -- 9079 of
+         * 9080 per-function .bc files differed in our reproducible-build
+         * gate (see `mx llvm-backend-determinism-test`).
+         *
+         * This hook fires after HostedUniverse has enumerated every
+         * reachable method and before the CompileQueue starts handing
+         * methods to compile threads.  That makes it the right (and only)
+         * place to compute a stable method-to-base map.
+         */
+        FeatureImpl.BeforeCompilationAccessImpl accessImpl = (FeatureImpl.BeforeCompilationAccessImpl) access;
+        LLVMGenerator.initializePatchpointBases(accessImpl.getMethods());
     }
 
     @Override

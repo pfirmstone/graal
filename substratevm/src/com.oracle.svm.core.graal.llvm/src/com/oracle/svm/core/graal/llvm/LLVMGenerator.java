@@ -40,12 +40,17 @@ import static jdk.graal.compiler.debug.GraalError.unimplemented;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
+import java.util.stream.Collectors;
+
+import com.oracle.svm.core.graal.code.SharedMethod;
 
 import org.graalvm.collections.Pair;
 import org.graalvm.nativeimage.c.constant.CEnum;
@@ -196,6 +201,12 @@ public class LLVMGenerator extends CoreProvidersDelegate implements LIRGenerator
         this.functionName = ((HostedMethod) method).getUniqueShortName();
         this.isEntryPoint = isEntryPoint(method);
         this.modifiesSpecialRegisters = modifiesSpecialRegisters(graph);
+
+        // Pre-assigned deterministic patchpoint-id base for this method.
+        // See the long comment on PATCHPOINT_BLOCK_BITS / methodPatchpointBases
+        // above for the rationale.
+        this.patchpointBase = initialPatchpointIdFor(method);
+        this.nextPatchpointIdLocal = this.patchpointBase;
 
         ResolvedJavaType returnType = method.getSignature().getReturnType(null).resolve(null);
         this.returnsEnum = returnType.isEnum();
@@ -1241,7 +1252,147 @@ public class LLVMGenerator extends CoreProvidersDelegate implements LIRGenerator
 
     /* Control flow */
 
-    static final AtomicLong nextPatchpointId = new AtomicLong(0);
+    /**
+     * Patchpoint ID allocation.
+     *
+     * <p>Each statepoint / stackmap call site embedded in the LLVM bitcode is
+     * tagged with a numeric id (used both as the {@code i64} operand to
+     * {@code @llvm.experimental.stackmap} and as the {@code "statepoint-id"}
+     * call-site attribute).  After llc emits the stack map, that id is the
+     * key used to correlate each stack-map record back to the compilation
+     * result; see {@link com.oracle.svm.core.graal.llvm.util.LLVMStackMapInfo}.
+     *
+     * <p>Until this code was made reproducible-build-friendly, ids came from
+     * a single process-wide {@code AtomicLong}, incremented from inside the
+     * parallel compile queue.  Whichever compile thread reached an
+     * {@code emitInvoke} / {@code emitForeignCall} first got the lower id;
+     * any two builds of the same source produced different ids for the same
+     * call site, and therefore different bitcode bytes.  9079 of 9080
+     * per-function {@code f<n>.bc} files differed in our reproducibility
+     * gate (see {@code mx llvm-backend-determinism-test}).
+     *
+     * <p>The fix is to assign each method a deterministic base before
+     * compilation starts and have each {@link LLVMGenerator} consume from a
+     * per-instance counter that starts at its method's base.  Per-method
+     * compilation is single-threaded inside a {@link LLVMGenerator} instance,
+     * so no atomic is required; cross-method parallelism is preserved.
+     *
+     * <p>{@link #initializePatchpointBases} is invoked from
+     * {@link LLVMFeature#beforeCompilation} after {@link HostedUniverse} has
+     * enumerated every reachable method but before compile threads start.
+     * Methods are sorted by {@link HostedMethod#getUniqueShortName()} (the
+     * same key used elsewhere in Native Image for deterministic ordering)
+     * and assigned 16-bit-wide id blocks: method[i] owns ids in
+     * {@code [i * 65536, i * 65536 + 65535]}.  We cap the total method
+     * count so the highest id still fits in a signed {@code int} (the
+     * {@link com.oracle.graal.pointsto.util.NumUtil#safeToInt} squeeze used
+     * downstream when the id is temporarily stored as a code offset).
+     */
+    private static final int PATCHPOINT_BLOCK_BITS = 16;
+    private static final int PATCHPOINT_BLOCK_SIZE = 1 << PATCHPOINT_BLOCK_BITS;
+    private static final int PATCHPOINT_MAX_METHODS = Integer.MAX_VALUE >>> PATCHPOINT_BLOCK_BITS;
+
+    /**
+     * Per-method patchpoint-id base.  Populated once by
+     * {@link #initializePatchpointBases} before compile threads start, then
+     * read-only for the rest of the build.  {@code volatile} for safe
+     * publication; lookups are wait-free.
+     */
+    private static volatile Map<HostedMethod, Integer> methodPatchpointBases;
+
+    /**
+     * Per-instance patchpoint-id state.  Single-threaded use; no atomic
+     * required because each {@link LLVMGenerator} instance is owned by one
+     * compile thread for the duration of one method.
+     *
+     * <p>{@code patchpointBase} is the inclusive lower bound of this method's
+     * pre-assigned 16-bit-wide id block; {@code nextPatchpointIdLocal} is the
+     * counter that starts at {@code patchpointBase} and is bumped by
+     * {@link #getAndIncrementPatchpointId}.  {@code long} only to keep the
+     * arithmetic explicit; the value is always in {@code int} range and is
+     * cast back at the use site.
+     */
+    private final long patchpointBase;
+    private long nextPatchpointIdLocal;
+
+    /**
+     * Assigns each method in {@code methods} a deterministic patchpoint-id
+     * base.  Must be invoked before any {@link LLVMGenerator} is constructed
+     * for that method.  Idempotent: subsequent calls overwrite the previous
+     * mapping (intended only for test harnesses that reuse the JVM).
+     *
+     * @param methods every method that will be compiled in this build; sorted
+     *                internally by {@link HostedMethod#getUniqueShortName()}
+     * @throws GraalError if there are more methods than the 31-bit positive
+     *                    int id space can accommodate at
+     *                    {@value #PATCHPOINT_BLOCK_SIZE} ids per method
+     *                    (roughly 32K methods); raise
+     *                    {@link #PATCHPOINT_BLOCK_BITS} or pre-assign
+     *                    smaller blocks if you hit this in practice
+     */
+    public static void initializePatchpointBases(Collection<? extends SharedMethod> methods) {
+        List<HostedMethod> sorted = methods.stream()
+                        .filter(m -> m instanceof HostedMethod)
+                        .map(m -> (HostedMethod) m)
+                        .sorted(Comparator.comparing(HostedMethod::getUniqueShortName))
+                        .collect(Collectors.toList());
+        if (sorted.size() > PATCHPOINT_MAX_METHODS) {
+            throw new GraalError(
+                "LLVM backend: %d methods exceed the patchpoint id space "
+                + "(%d-method ceiling at %d ids per method).  Reduce "
+                + "LLVMGenerator.PATCHPOINT_BLOCK_BITS or rework patchpoint "
+                + "ids to span more than 31 bits.",
+                sorted.size(), PATCHPOINT_MAX_METHODS, PATCHPOINT_BLOCK_SIZE);
+        }
+        Map<HostedMethod, Integer> map = new HashMap<>(sorted.size() * 2);
+        for (int i = 0; i < sorted.size(); i++) {
+            map.put(sorted.get(i), i * PATCHPOINT_BLOCK_SIZE);
+        }
+        methodPatchpointBases = Collections.unmodifiableMap(map);
+    }
+
+    /**
+     * Returns the next patchpoint id for this method and advances the
+     * per-instance counter.  Throws if the method has exceeded its
+     * {@value #PATCHPOINT_BLOCK_SIZE}-id block (in practice no real method
+     * comes close: a typical HelloWorld is fewer than 10 patchpoints per
+     * function).
+     */
+    public long getAndIncrementPatchpointId() {
+        long id = nextPatchpointIdLocal++;
+        if (id >= patchpointBase + PATCHPOINT_BLOCK_SIZE) {
+            throw new GraalError("LLVM backend: method %s exceeded its %d-id "
+                                 + "patchpoint block.  Raise LLVMGenerator."
+                                 + "PATCHPOINT_BLOCK_BITS or split the method.",
+                                 functionName, PATCHPOINT_BLOCK_SIZE);
+        }
+        return id;
+    }
+
+    private static long initialPatchpointIdFor(ResolvedJavaMethod method) {
+        Map<HostedMethod, Integer> map = methodPatchpointBases;
+        if (map == null) {
+            throw new GraalError("LLVMGenerator.initializePatchpointBases was "
+                                 + "not invoked before compilation.  See "
+                                 + "LLVMFeature.beforeCompilation.");
+        }
+        if (!(method instanceof HostedMethod)) {
+            throw new GraalError("LLVM backend: cannot allocate patchpoint ids "
+                                 + "for non-HostedMethod " + method);
+        }
+        Integer base = map.get(method);
+        if (base == null) {
+            throw new GraalError("LLVM backend: method %s was not present in "
+                                 + "the HostedUniverse at LLVMFeature."
+                                 + "beforeCompilation time; cannot assign a "
+                                 + "deterministic patchpoint id base.  This "
+                                 + "usually indicates a method created after "
+                                 + "the compile queue started -- file a bug "
+                                 + "with the LLVM backend maintainers.",
+                                 method);
+        }
+        return base.longValue();
+    }
 
     LLVMValueRef buildStatepointCall(LLVMValueRef callee, boolean nativeABI, long statepointId, LLVMValueRef... args) {
         LLVMValueRef savedThread = nativeABI ? saveSpecialRegister(builder, ReservedRegisters.singleton().getThreadRegister()) : null;
@@ -1318,7 +1469,7 @@ public class LLVMGenerator extends CoreProvidersDelegate implements LIRGenerator
             debugInfo = state.debugInfo();
         }
 
-        long patchpointId = nextPatchpointId.getAndIncrement();
+        long patchpointId = getAndIncrementPatchpointId();
         compilationResult.recordCall(NumUtil.safeToInt(patchpointId), 0, targetMethod, debugInfo, true);
 
         CallingConvention.Type callType = ((SubstrateCallingConvention) linkage.getOutgoingCallingConvention()).getType();
@@ -1438,7 +1589,7 @@ public class LLVMGenerator extends CoreProvidersDelegate implements LIRGenerator
         LLVMBasicBlockRef block = builder.appendBasicBlock("main");
         builder.positionAtEnd(block);
 
-        long startPatchpointId = LLVMGenerator.nextPatchpointId.getAndIncrement();
+        long startPatchpointId = getAndIncrementPatchpointId();
         builder.buildStackmap(builder.constantLong(startPatchpointId));
         compilationResult.recordInfopoint(NumUtil.safeToInt(startPatchpointId), null, InfopointReason.METHOD_START);
 

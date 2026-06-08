@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -218,7 +218,7 @@ public class NodeLLVMBuilder implements NodeLIRBuilderTool, SubstrateNodeLIRBuil
         if (block == graph.getLastSchedule().getCFG().getStartBlock()) {
             assert block.getPredecessorCount() == 0;
 
-            long startPatchpointID = LLVMGenerator.nextPatchpointId.getAndIncrement();
+            long startPatchpointID = gen.getAndIncrementPatchpointId();
             builder.buildStackmap(builder.constantLong(startPatchpointID));
             gen.getCompilationResult().recordInfopoint(NumUtil.safeToInt(startPatchpointID), null, InfopointReason.METHOD_START);
 
@@ -522,7 +522,7 @@ public class NodeLLVMBuilder implements NodeLIRBuilderTool, SubstrateNodeLIRBuil
         LLVMValueRef callee;
         boolean isVoid;
         LLVMValueRef[] args = getCallArguments(arguments);
-        long patchpointId = LLVMGenerator.nextPatchpointId.getAndIncrement();
+        long patchpointId = gen.getAndIncrementPatchpointId();
         if (callTarget instanceof DirectCallTargetNode) {
             callee = gen.getFunction(targetMethod);
             isVoid = gen.isVoidReturnType(gen.getLLVMFunctionReturnType(targetMethod, false));
@@ -665,7 +665,7 @@ public class NodeLLVMBuilder implements NodeLIRBuilderTool, SubstrateNodeLIRBuil
         anchor = builder.buildIntToPtr(anchor, builder.rawPointerType());
 
         if (!nativeABI) {
-            int anchorPatchpointId = NumUtil.safeToInt(LLVMGenerator.nextPatchpointId.getAndIncrement());
+            int anchorPatchpointId = NumUtil.safeToInt(gen.getAndIncrementPatchpointId());
             gen.getCompilationResult().recordCall(anchorPatchpointId, 0, null, debugInfo, false);
             gen.recordJavaFrameAnchorReferenceMapSource(anchorPatchpointId, NumUtil.safeToInt(patchpointId));
 
@@ -741,7 +741,7 @@ public class NodeLLVMBuilder implements NodeLIRBuilderTool, SubstrateNodeLIRBuil
         LLVMValueRef retrieveExceptionFunction = gen.getFunction(LLVMExceptionUnwind.getRetrieveExceptionMethod(gen.getMetaAccess()));
         LLVMValueRef[] args = new LLVMValueRef[0];
         SubstrateCallingConventionKind.Java.toType(true);
-        LLVMValueRef exception = gen.buildStatepointCall(retrieveExceptionFunction, false, LLVMGenerator.nextPatchpointId.getAndIncrement(), args);
+        LLVMValueRef exception = gen.buildStatepointCall(retrieveExceptionFunction, false, gen.getAndIncrementPatchpointId(), args);
         setResult(node, exception);
     }
 
