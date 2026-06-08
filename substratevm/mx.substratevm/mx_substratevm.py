@@ -501,7 +501,17 @@ def svm_gate_body(args, tasks):
                     mx.get_os(), mx.get_arch()))
             else:
                 with native_image_context(IMAGE_ASSERTION_FLAGS):
+                    # Default variant: minimal flags, exercises the LLVM IR
+                    # pipeline only.  Catches the original AtomicInteger race
+                    # and any equivalent introduced by future refactors.
                     llvm_backend_determinism_test([])
+                    # Debug-info variant: adds -H:GenerateDebugInfo=1, which
+                    # embeds source-file paths and DWARF metadata.  Debug info
+                    # is historically the largest source of native-binary
+                    # nondeterminism and is therefore worth a separate run so
+                    # that a regression there does not require manual
+                    # invocation to surface.
+                    llvm_backend_determinism_test(['--with-debug-info'])
 
     with Task('terminus helloworld', tasks, tags=[GraalTags.terminus]) as t:
         if t: _run_terminus_gate(args)
@@ -2541,13 +2551,51 @@ def helloworld(args, config=None):
 # Any stage whose hash differs between the two runs is reported individually so
 # that a future regression is diagnosed at the right pipeline boundary.
 
+# Each tuple is (glob_pattern, stage_order, stage_label, classifier_predicate).
+# stage_order is the chronological position in the LLVM pipeline: lower numbers
+# run earlier, so a difference at a lower-numbered stage is the *root cause*
+# of any differences observed at higher-numbered stages.  The classifier
+# predicate matches a filename to its stage (since 'f*.bc' would also match
+# 'f0o.bc' under glob); the order of evaluation is significant.
+#
+# Pipeline (mirrors LLVMNativeImageCodeCache.layoutMethods):
+#   1. f<n>.bc     per-function bitcode emitted by writeBitcode
+#                  (the AtomicInteger race used to live here)
+#   2. b<n>.bc     linked batches produced by createBitcodeBatches
+#                  (skipped when LLVMMaxFunctionsPerBatch=1)
+#   3. b<n>o.bc    optimised batches produced by compileBitcodeBatches
+#                  via llvmOptimize
+#   4. b<n>.o      compiled batches produced by compileBitcodeBatches
+#                  via llvmCompile
+#   5. llvm.o      final relocatable object emitted by linkCompiledBatches
+#   6. <image>     final native binary produced by the C toolchain link step
+
 _LLVM_BACKEND_DETERMINISM_STAGES = (
-    'f*.bc',       # 1. per-function bitcode (fixed point of the AtomicInteger race)
-    'b*.bc',       # 2. linked batches (skipped when LLVMMaxFunctionsPerBatch=1)
-    'b*o.bc',      # 3. optimised batches
-    'b*.o',        # 4. compiled batches
-    'llvm.o',      # 5. final relocatable object
+    ('f*.bc',  1, 'per-function bitcode (writeBitcode)',
+     lambda name: name.startswith('f') and name.endswith('.bc') and 'o.bc' not in name),
+    ('b*.bc',  2, 'linked batches (createBitcodeBatches via llvm-link)',
+     lambda name: name.startswith('b') and name.endswith('.bc') and 'o.bc' not in name),
+    ('b*o.bc', 3, 'optimised batches (compileBitcodeBatches via opt)',
+     lambda name: name.startswith('b') and name.endswith('o.bc')),
+    ('b*.o',   4, 'compiled batches (compileBitcodeBatches via llc)',
+     lambda name: name.startswith('b') and name.endswith('.o')),
+    ('llvm.o', 5, 'final relocatable object (linkCompiledBatches via lld)',
+     lambda name: name == 'llvm.o'),
 )
+
+_LLVM_BACKEND_FINAL_BINARY_STAGE = (6, 'final native binary (C toolchain link)')
+
+
+def _classify_stage(relative_path):
+    """Returns (stage_order, stage_label) for an SVM-*/llvm-relative filename,
+    or (99, 'unknown') for files we don't recognise.  The first matching
+    predicate wins; predicates are ordered to disambiguate f<n>.bc from
+    f<n>o.bc-style names."""
+    base = os.path.basename(relative_path)
+    for _pat, order, label, pred in _LLVM_BACKEND_DETERMINISM_STAGES:
+        if pred(base):
+            return order, label
+    return 99, 'unknown (' + base + ')'
 
 
 def _sha256_of_file(path):
@@ -2559,12 +2607,13 @@ def _sha256_of_file(path):
     return h.hexdigest()
 
 
-def _hashes_under(tempdir, patterns):
+def _hashes_under(tempdir):
     """
-    Returns {relative_path: sha256_hex} for every file matching any of
-    ``patterns`` under the single ``SVM-*/llvm/`` directory that Native Image
-    creates inside ``tempdir``.  Filenames are sorted so the result is itself
-    canonical.
+    Returns {relative_path: sha256_hex} for every LLVM-stage artefact under
+    the single ``SVM-*/llvm/`` directory that Native Image creates inside
+    ``tempdir``.  Files are matched via the per-stage glob patterns in
+    ``_LLVM_BACKEND_DETERMINISM_STAGES``.  Filenames are sorted so the
+    returned mapping is canonical.
     """
     llvm_dirs = glob(join(tempdir, 'SVM-*', 'llvm'))
     if len(llvm_dirs) != 1:
@@ -2572,7 +2621,7 @@ def _hashes_under(tempdir, patterns):
             tempdir, llvm_dirs))
     llvm_dir = llvm_dirs[0]
     results = {}
-    for pat in patterns:
+    for pat, _order, _label, _pred in _LLVM_BACKEND_DETERMINISM_STAGES:
         for path in sorted(glob(join(llvm_dir, pat))):
             results[os.path.relpath(path, llvm_dir)] = _sha256_of_file(path)
     return results
@@ -2580,20 +2629,28 @@ def _hashes_under(tempdir, patterns):
 
 def _diff_hashes(label_a, hashes_a, label_b, hashes_b):
     """
-    Returns a list of human-readable strings describing every difference
-    between two ``{path: hash}`` maps.  Empty list means the maps are equal.
+    Returns a list of (stage_order, stage_label, message) tuples describing
+    every difference between two ``{path: hash}`` maps.  Empty list means the
+    maps are equal.  The stage_order field lets the caller identify the
+    *first* divergent stage (the root cause of any later divergences).
     """
     diffs = []
     only_a = sorted(set(hashes_a) - set(hashes_b))
     only_b = sorted(set(hashes_b) - set(hashes_a))
     for path in only_a:
-        diffs.append('  - {!r} present in {} but not in {}'.format(path, label_a, label_b))
+        order, lbl = _classify_stage(path)
+        diffs.append((order, lbl,
+                      '  - {!r} present in {} but not in {}'.format(path, label_a, label_b)))
     for path in only_b:
-        diffs.append('  - {!r} present in {} but not in {}'.format(path, label_b, label_a))
+        order, lbl = _classify_stage(path)
+        diffs.append((order, lbl,
+                      '  - {!r} present in {} but not in {}'.format(path, label_b, label_a)))
     for path in sorted(set(hashes_a) & set(hashes_b)):
         if hashes_a[path] != hashes_b[path]:
-            diffs.append('  - {!r} differs: {}={} vs {}={}'.format(
-                path, label_a, hashes_a[path], label_b, hashes_b[path]))
+            order, lbl = _classify_stage(path)
+            diffs.append((order, lbl,
+                          '  - {!r} differs: {}={} vs {}={}'.format(
+                              path, label_a, hashes_a[path], label_b, hashes_b[path])))
     return diffs
 
 
@@ -2607,7 +2664,7 @@ def _llvm_backend_supported_here():
 
 
 @mx.command(suite_name=suite.name, command_name='llvm-backend-determinism-test',
-            usage_msg='[--keep-output] [<extra native-image args>...]')
+            usage_msg='[--keep-output] [--with-debug-info] [<extra native-image args>...]')
 def llvm_backend_determinism_test(args, config=None):
     """
     Reproducible-build gate for the LLVM backend.
@@ -2616,11 +2673,21 @@ def llvm_backend_determinism_test(args, config=None):
     every intermediate LLVM artefact (f*.bc, b*.bc, b*o.bc, b*.o, llvm.o) and
     the final native image are byte-identical between the two builds.
 
+    On failure, the *first divergent stage* is reported as the banner finding:
+    a divergence at the per-function bitcode stage (f*.bc) is the root cause
+    of any later divergences, so naming it explicitly points the developer at
+    the right code path rather than at a downstream symptom.
+
     Aborts on hosts where the LLVM backend cannot be built (e.g. Windows).
     """
     parser = ArgumentParser(prog='mx llvm-backend-determinism-test')
     parser.add_argument('--keep-output', action='store_true',
                         help='Do not delete the per-run output directories on success')
+    parser.add_argument('--with-debug-info', action='store_true',
+                        help='Also build with -H:GenerateDebugInfo=1.  Debug info embeds '
+                             'source-file paths and DWARF metadata, both common sources of '
+                             'nondeterminism, so this variant is strictly stricter than the '
+                             'default.')
     parser.add_argument('extra_args', nargs='*', default=[],
                         help='Extra arguments forwarded to native-image (e.g. -O1)')
     parsed = parser.parse_args(args)
@@ -2630,7 +2697,8 @@ def llvm_backend_determinism_test(args, config=None):
                  '(amd64/aarch64/riscv64) and macOS (amd64/aarch64); this host is '
                  '{}/{}'.format(mx.get_os(), mx.get_arch()))
 
-    base = join(svmbuild_dir(suite), 'llvm-backend-determinism')
+    label = 'with-debug-info' if parsed.with_debug_info else 'default'
+    base = join(svmbuild_dir(suite), 'llvm-backend-determinism-' + label)
     mx_util.ensure_dir_exists(base)
     # Two independent output dirs so that the temp directories produced by
     # Native Image do not collide.
@@ -2641,13 +2709,19 @@ def llvm_backend_determinism_test(args, config=None):
             shutil.rmtree(d)
         mx_util.ensure_dir_exists(d)
 
+    # Experimental options forwarded to both builds.  LLVMMaxFunctionsPerBatch=1
+    # is the linchpin: it keeps every f<n>.bc as a final artefact rather than
+    # transiently overwriting them during batching, which is exactly where the
+    # AtomicInteger race manifested.  GenerateDebugInfo=1 is opt-in because it
+    # roughly triples the intermediate-file footprint.
+    experimental = ['-H:LLVMMaxFunctionsPerBatch=1']
+    if parsed.with_debug_info:
+        experimental.append('-H:GenerateDebugInfo=1')
+
     def _build_once(out_dir):
         """Runs `helloworld` once with --tool:llvm-backend and -H:TempDirectory=out_dir.
 
-        Returns the path to the produced binary.  We use LLVMMaxFunctionsPerBatch=1
-        so that the per-function f<n>.bc files are also visible as final
-        intermediates (and not transient overwrites), which is exactly where the
-        original race manifested.
+        Returns the path to the produced binary.
         """
         binary_path = join(out_dir, 'helloworld')
         helloworld([
@@ -2655,33 +2729,61 @@ def llvm_backend_determinism_test(args, config=None):
             '--',
             '--tool:llvm-backend',
             '-H:TempDirectory=' + out_dir,
-        ] + svm_experimental_options(['-H:LLVMMaxFunctionsPerBatch=1']) + parsed.extra_args,
+        ] + svm_experimental_options(experimental) + parsed.extra_args,
                    config=config)
         return binary_path
 
-    mx.log('llvm-backend-determinism: first build')
+    mx.log('llvm-backend-determinism ({}): first build'.format(label))
     binary_a = _build_once(out_a)
-    mx.log('llvm-backend-determinism: second build')
+    mx.log('llvm-backend-determinism ({}): second build'.format(label))
     binary_b = _build_once(out_b)
 
-    hashes_a = _hashes_under(out_a, _LLVM_BACKEND_DETERMINISM_STAGES)
-    hashes_b = _hashes_under(out_b, _LLVM_BACKEND_DETERMINISM_STAGES)
+    hashes_a = _hashes_under(out_a)
+    hashes_b = _hashes_under(out_b)
 
     diffs = _diff_hashes('run-a', hashes_a, 'run-b', hashes_b)
 
     # Final binary: produced outside the SVM-*/llvm/ dir by the C toolchain
     # link step.  Hash it separately so a difference there is reported even if
     # the LLVM intermediates all match.
+    bin_order, bin_label = _LLVM_BACKEND_FINAL_BINARY_STAGE
     if exists(binary_a) and exists(binary_b):
         h_bin_a = _sha256_of_file(binary_a)
         h_bin_b = _sha256_of_file(binary_b)
         if h_bin_a != h_bin_b:
-            diffs.append('  - final binary differs: run-a={} vs run-b={}'.format(h_bin_a, h_bin_b))
+            diffs.append((bin_order, bin_label,
+                          '  - final binary differs: run-a={} vs run-b={}'.format(
+                              h_bin_a, h_bin_b)))
 
     if diffs:
-        mx.log('LLVM-backend determinism FAILED for {} files / artefacts:'.format(len(diffs)))
-        for line in diffs:
-            mx.log(line)
+        # Sort by stage order so the chronologically earliest divergence is
+        # reported first.  The first divergent stage is the root cause; later
+        # stages are downstream symptoms of the same race / bug.
+        diffs.sort(key=lambda d: (d[0], d[2]))
+        first_order, first_stage_label, _msg = diffs[0]
+
+        mx.log('=' * 72)
+        mx.log('LLVM-backend determinism FAILED ({} variant, {} differences)'.format(
+            label, len(diffs)))
+        mx.log('=' * 72)
+        mx.log('')
+        mx.log('First divergent stage: #{} - {}'.format(first_order, first_stage_label))
+        mx.log('')
+        mx.log('  This is the root cause; any divergences at later stages are')
+        mx.log('  downstream consequences of the same nondeterminism source.')
+        mx.log('  Investigate the producer of stage #{} before chasing the rest.'.format(first_order))
+        mx.log('')
+
+        # Group diff messages by stage so the developer sees the picture per stage.
+        from itertools import groupby
+        for stage_order, group in groupby(diffs, key=lambda d: (d[0], d[1])):
+            order, lbl = stage_order
+            grp = list(group)
+            mx.log('Stage #{} ({}): {} difference(s)'.format(order, lbl, len(grp)))
+            for _o, _l, msg in grp:
+                mx.log(msg)
+            mx.log('')
+
         mx.log('Per-stage hashes (run-a):')
         for k in sorted(hashes_a):
             mx.log('  {}  {}'.format(hashes_a[k], k))
@@ -2689,10 +2791,11 @@ def llvm_backend_determinism_test(args, config=None):
         for k in sorted(hashes_b):
             mx.log('  {}  {}'.format(hashes_b[k], k))
         mx.abort('LLVM backend produced non-deterministic output across two identical builds. '
-                 'See the per-stage hashes above to identify the first stage where they diverge.')
+                 'See the "First divergent stage" banner above for the root cause.')
 
-    mx.log('LLVM-backend determinism OK: {} intermediate artefacts and the final '
-           'binary hash identically across two independent builds.'.format(len(hashes_a)))
+    mx.log('LLVM-backend determinism OK ({} variant): {} intermediate artefacts '
+           'and the final binary hash identically across two independent builds.'
+           .format(label, len(hashes_a)))
 
     if not parsed.keep_output:
         shutil.rmtree(out_a, ignore_errors=True)

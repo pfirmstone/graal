@@ -40,76 +40,82 @@
 #
 # -----------------------------------------------------------------------------
 #
-# Reproducible-build gate for the Native Image LLVM backend.
+# Cross-platform reproducible-build matrix for the Native Image LLVM backend.
 #
-# What this workflow does
-# -----------------------
-#   1. Builds GraalVM CE for JDK with the LLVM backend tool component enabled
-#      (--components 'Native Image,Native Image LLVM Backend').
-#   2. Runs `mx llvm-backend-determinism-test`, which compiles a trivial
-#      HelloWorld twice with `--tool:llvm-backend -H:TempDirectory=<dir>` and
-#      asserts byte-for-byte equality of every intermediate LLVM artefact
-#      (f*.bc, b*.bc, b*o.bc, b*.o, llvm.o) and of the final native binary.
-#   3. On failure, the per-stage hash lists from both runs are dumped so that
-#      any future regression is diagnosed at the boundary where it first
-#      appears.
+# Scope
+# -----
+#   This is the BROAD sweep complementing the focused per-push workflow at
+#   llvm-backend-determinism.yml.  It runs the same `mx llvm-backend-
+#   determinism-test` gate on every supported host independently, with both
+#   the default and the --with-debug-info variants.  Each matrix cell is
+#   self-contained: a build and its repeat must produce byte-identical
+#   intermediates and final binary, but the workflow does NOT compare bytes
+#   across cells (that is not a property the LLVM backend currently
+#   targets; different target triples, link scripts and debug source paths
+#   make cross-cell equality unachievable in general).
 #
-# Why this exists
-# ---------------
-#   Until commit 197c7aa, LLVMNativeImageCodeCache.writeBitcode assigned the
-#   per-function bitcode file id from inside a parallel BatchExecutor
-#   runnable via AtomicInteger.incrementAndGet(). Because the executor runs
-#   its tasks in parallel, the id was determined by thread-scheduling order
-#   rather than by source order, so the `f<n>.bc <-> method` mapping varied
-#   between runs of the same build, and the final `llvm.o` differed
-#   byte-for-byte across builds of the same source. That defeated
-#   reproducible-build / SCAP-style content-addressing of native artefacts
-#   produced via the LLVM IR pipeline.
+#   What the matrix catches:
+#     * A platform-specific source of nondeterminism that the baseline
+#       ubuntu-22.04 run happens not to exercise (e.g. macOS Finder
+#       extended-attribute injection into the temp directory).
+#     * A glibc version skew between ubuntu-22.04 and ubuntu-24.04 that
+#       changes deflate stream timing in a way that leaks into binary
+#       layout.
+#     * A regression that is masked by Linux thread-scheduling but exposed
+#       under macOS Grand Central Dispatch's different worker pool.
 #
-#   The fix dispatches via BatchExecutor.forEach(int, IntFunction) instead,
-#   so each runnable receives its list index deterministically. This
-#   workflow guards that property mechanically.
+# Trigger policy
+# --------------
+#   * Manual workflow_dispatch.
+#   * Weekly schedule (Mondays 04:00 UTC) so a slow regression doesn't
+#     sit dormant for months.
+#   * Push/PR that touches THIS workflow file (self-test).
 #
-# Host requirements
-# -----------------
-#   The LLVM backend is only built on Linux amd64/aarch64/riscv64 and macOS
-#   amd64/aarch64. This workflow targets ubuntu-22.04 (x86_64) because
-#   that matches the LLVM_TOOLCHAIN distribution the build will download.
+#   It does NOT trigger on every LLVM-backend source change; the focused
+#   single-platform workflow does that.
 
-name: LLVM Backend Determinism
+name: LLVM Backend Determinism (matrix)
 
 on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'    # Mondays 04:00 UTC
   push:
-    branches: [ master ]
     paths:
-      - 'substratevm/src/com.oracle.svm.core.graal.llvm/**'
-      - 'substratevm/mx.substratevm/mx_substratevm.py'
-      - '.github/workflows/llvm-backend-determinism.yml'
+      - '.github/workflows/llvm-backend-determinism-matrix.yml'
   pull_request:
     paths:
-      - 'substratevm/src/com.oracle.svm.core.graal.llvm/**'
-      - 'substratevm/mx.substratevm/mx_substratevm.py'
-      - '.github/workflows/llvm-backend-determinism.yml'
-  workflow_dispatch:
-    inputs:
-      extra-native-image-args:
-        description: 'Extra arguments forwarded to native-image (e.g. -O1)'
-        default: ''
-        required: false
-        type: string
+      - '.github/workflows/llvm-backend-determinism-matrix.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: llvm-backend-determinism-${{ github.ref }}
-  cancel-in-progress: true
+  group: llvm-backend-determinism-matrix-${{ github.ref }}
+  cancel-in-progress: false   # weekly runs should never cancel each other
 
 jobs:
-  determinism:
-    name: Build + LLVM backend determinism check
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
+  determinism-matrix:
+    name: ${{ matrix.host }} ${{ matrix.variant }}
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false   # one platform's failure must not hide another's pass
+      matrix:
+        # Host runners supported by GitHub Actions today on which the
+        # Native Image LLVM backend can be built (Linux amd64, macOS amd64,
+        # macOS arm64).  Each host runs both the default and the
+        # --with-debug-info variant so a debug-DWARF regression is caught
+        # separately from a base-pipeline regression.
+        host:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - macos-13          # x86_64
+          - macos-14          # Apple Silicon (arm64)
+        variant:
+          - ''                # default
+          - '--with-debug-info'
 
     steps:
       - name: Checkout graal
@@ -157,39 +163,53 @@ jobs:
           ${MX_PATH}/mx "${MX_ARGS[@]}" build
           ln -s "$(${MX_PATH}/mx "${MX_ARGS[@]}" graalvm-home)" "${GRAALVM_HOME}"
 
-      - name: Show GraalVM version info
+      - name: Show platform + GraalVM version info
         shell: bash
         run: |
+          echo "= uname -a ===================="
+          uname -a
+          echo "==============================="
           echo "= 'java --version' ============"
           "${GRAALVM_HOME}/bin/java" --version
           echo "==============================="
           echo "= 'native-image --version' ===="
           "${GRAALVM_HOME}/bin/native-image" --version
           echo "==============================="
-          echo "= LLVM toolchain present? ====="
-          ls -la "${GRAALVM_HOME}/lib/svm/llvm-bin/" 2>/dev/null \
-            | head -20 \
-            || echo "(llvm-bin not at the expected path; checking module layer instead)"
-          echo "==============================="
 
-      - name: Run llvm-backend-determinism-test
+      - name: Run llvm-backend-determinism-test (${{ matrix.variant || 'default' }})
         shell: bash
         run: |
           cd substratevm
           ${MX_PATH}/mx --java-home "${JAVA_HOME}" --dy /substratevm \
-            llvm-backend-determinism-test \
-            ${{ github.event.inputs.extra-native-image-args || '' }}
+            llvm-backend-determinism-test ${{ matrix.variant }}
 
-      - name: Upload temp dirs on failure for forensic inspection
+      - name: Upload temp dirs on failure
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: llvm-backend-determinism-artefacts
-          # The mx command emits two siblings, one per variant:
-          #   svmbuild/llvm-backend-determinism-default/{run-a,run-b}
-          #   svmbuild/llvm-backend-determinism-with-debug-info/{run-a,run-b}
-          # The wildcard picks up whichever was produced.
+          # Disambiguate so all matrix cells can upload without collision.
+          name: llvm-backend-determinism-${{ matrix.host }}-${{ matrix.variant && 'debug' || 'default' }}
           path: |
             substratevm/svmbuild/llvm-backend-determinism-*/
-          if-no-files-found: warn
-          retention-days: 7
+          if-no-files-found: ignore
+          retention-days: 14
+
+  summary:
+    name: Matrix summary
+    runs-on: ubuntu-22.04
+    needs: determinism-matrix
+    if: always()
+    steps:
+      - name: Report matrix result
+        shell: bash
+        run: |
+          # ${{ needs.determinism-matrix.result }} is the aggregate result for
+          # the whole strategy.  Without this aggregator, GitHub's UI would
+          # show 8 independent green/red dots; this gives one verdict to
+          # gate downstream automation on.
+          result='${{ needs.determinism-matrix.result }}'
+          echo "Matrix aggregate result: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::At least one LLVM-backend determinism matrix cell failed."
+            exit 1
+          fi
