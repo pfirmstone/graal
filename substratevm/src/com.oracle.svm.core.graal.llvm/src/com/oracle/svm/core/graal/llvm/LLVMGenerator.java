@@ -50,7 +50,7 @@ import java.util.Map;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
-import com.oracle.svm.core.graal.code.SharedMethod;
+import com.oracle.svm.core.meta.SharedMethod;
 
 import org.graalvm.collections.Pair;
 import org.graalvm.nativeimage.c.constant.CEnum;
