@@ -24,6 +24,7 @@
 #
 
 import filecmp
+import hashlib
 import json
 import os
 import pathlib
@@ -273,7 +274,14 @@ GraalTags = Tags([
     'truffle_unittests',
     'check_libcontainer_annotations',
     'check_libcontainer_namespace',
-    'java_agent'
+    'java_agent',
+    # Reproducible-build gate for the LLVM backend.  Builds a trivial
+    # HelloWorld twice with --tool:llvm-backend and asserts that every f*.bc,
+    # b*.bc, b*o.bc, b*.o, llvm.o and the final binary hash identically across
+    # the two builds.  Guards against regressions of the pre-2026 race in
+    # LLVMNativeImageCodeCache.writeBitcode that assigned per-function bitcode
+    # ids from inside the parallel BatchExecutor runnable.
+    'llvm_backend_determinism',
 ])
 
 def vm_native_image_path(config=None):
@@ -485,6 +493,15 @@ def svm_gate_body(args, tasks):
             with native_image_context(IMAGE_ASSERTION_FLAGS) as native_image:
                 image_demo_task(args.extra_image_builder_arguments)
                 helloworld(svm_experimental_options(['-H:+RunMainInNewThread']) + args.extra_image_builder_arguments)
+
+    with Task('LLVM backend reproducible build', tasks, tags=[GraalTags.llvm_backend_determinism]) as t:
+        if t:
+            if not _llvm_backend_supported_here():
+                mx.warn('LLVM backend determinism gate skipped on {}/{}: no LLVM backend on this host'.format(
+                    mx.get_os(), mx.get_arch()))
+            else:
+                with native_image_context(IMAGE_ASSERTION_FLAGS):
+                    llvm_backend_determinism_test([])
 
     with Task('terminus helloworld', tasks, tags=[GraalTags.terminus]) as t:
         if t: _run_terminus_gate(args)
@@ -2493,6 +2510,193 @@ def helloworld(args, config=None):
     builds a Hello, World! native image.
     """
     run_helloworld_command(args, config, "helloworld")
+
+
+# ---------------------------------------------------------------------------
+# LLVM-backend reproducible-build gate
+# ---------------------------------------------------------------------------
+#
+# Builds the same trivial helloworld twice with --tool:llvm-backend and asserts
+# that every intermediate LLVM artefact and the final image are byte-identical
+# between the two builds.  Guards against regressions of the kind fixed by
+# "LLVM backend: derive bitcode file id from list index, not a parallel
+# counter": before that fix, the per-function bitcode id was assigned by an
+# AtomicInteger.incrementAndGet() inside the parallel BatchExecutor runnable,
+# which meant that f<n>.bc <-> method was thread-scheduling-dependent and the
+# final llvm.o differed across runs of the same build.
+#
+# The gate runs only where the LLVM backend itself is buildable (currently
+# Linux amd64/aarch64/riscv64 and macOS amd64/aarch64; Windows is unsupported
+# because no JavaCPP windows binary is shipped).  It aborts gracefully on any
+# other host.
+#
+# Pipeline mirrored by the assertion:
+#   1. f<n>.bc       - per-function bitcode (where the race used to live)
+#   2. b<n>.bc       - linked batches
+#   3. b<n>o.bc      - optimised batches
+#   4. b<n>.o        - llc output
+#   5. llvm.o        - final relocatable object
+#   6. <image>       - native binary produced by the C toolchain link step
+#
+# Any stage whose hash differs between the two runs is reported individually so
+# that a future regression is diagnosed at the right pipeline boundary.
+
+_LLVM_BACKEND_DETERMINISM_STAGES = (
+    'f*.bc',       # 1. per-function bitcode (fixed point of the AtomicInteger race)
+    'b*.bc',       # 2. linked batches (skipped when LLVMMaxFunctionsPerBatch=1)
+    'b*o.bc',      # 3. optimised batches
+    'b*.o',        # 4. compiled batches
+    'llvm.o',      # 5. final relocatable object
+)
+
+
+def _sha256_of_file(path):
+    """Returns the lowercase-hex SHA-256 of a file's contents."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as fp:
+        for chunk in iter(lambda: fp.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _hashes_under(tempdir, patterns):
+    """
+    Returns {relative_path: sha256_hex} for every file matching any of
+    ``patterns`` under the single ``SVM-*/llvm/`` directory that Native Image
+    creates inside ``tempdir``.  Filenames are sorted so the result is itself
+    canonical.
+    """
+    llvm_dirs = glob(join(tempdir, 'SVM-*', 'llvm'))
+    if len(llvm_dirs) != 1:
+        mx.abort('Expected exactly one SVM-*/llvm directory under {}, found {}'.format(
+            tempdir, llvm_dirs))
+    llvm_dir = llvm_dirs[0]
+    results = {}
+    for pat in patterns:
+        for path in sorted(glob(join(llvm_dir, pat))):
+            results[os.path.relpath(path, llvm_dir)] = _sha256_of_file(path)
+    return results
+
+
+def _diff_hashes(label_a, hashes_a, label_b, hashes_b):
+    """
+    Returns a list of human-readable strings describing every difference
+    between two ``{path: hash}`` maps.  Empty list means the maps are equal.
+    """
+    diffs = []
+    only_a = sorted(set(hashes_a) - set(hashes_b))
+    only_b = sorted(set(hashes_b) - set(hashes_a))
+    for path in only_a:
+        diffs.append('  - {!r} present in {} but not in {}'.format(path, label_a, label_b))
+    for path in only_b:
+        diffs.append('  - {!r} present in {} but not in {}'.format(path, label_b, label_a))
+    for path in sorted(set(hashes_a) & set(hashes_b)):
+        if hashes_a[path] != hashes_b[path]:
+            diffs.append('  - {!r} differs: {}={} vs {}={}'.format(
+                path, label_a, hashes_a[path], label_b, hashes_b[path]))
+    return diffs
+
+
+def _llvm_backend_supported_here():
+    """LLVM backend is only built on Linux amd64/aarch64/riscv64 and macOS amd64/aarch64."""
+    if mx.is_linux():
+        return mx.get_arch() in ('amd64', 'aarch64', 'riscv64')
+    if mx.is_darwin():
+        return mx.get_arch() in ('amd64', 'aarch64')
+    return False
+
+
+@mx.command(suite_name=suite.name, command_name='llvm-backend-determinism-test',
+            usage_msg='[--keep-output] [<extra native-image args>...]')
+def llvm_backend_determinism_test(args, config=None):
+    """
+    Reproducible-build gate for the LLVM backend.
+
+    Builds a trivial HelloWorld twice with --tool:llvm-backend and asserts that
+    every intermediate LLVM artefact (f*.bc, b*.bc, b*o.bc, b*.o, llvm.o) and
+    the final native image are byte-identical between the two builds.
+
+    Aborts on hosts where the LLVM backend cannot be built (e.g. Windows).
+    """
+    parser = ArgumentParser(prog='mx llvm-backend-determinism-test')
+    parser.add_argument('--keep-output', action='store_true',
+                        help='Do not delete the per-run output directories on success')
+    parser.add_argument('extra_args', nargs='*', default=[],
+                        help='Extra arguments forwarded to native-image (e.g. -O1)')
+    parsed = parser.parse_args(args)
+
+    if not _llvm_backend_supported_here():
+        mx.abort('llvm-backend-determinism-test is only supported on Linux '
+                 '(amd64/aarch64/riscv64) and macOS (amd64/aarch64); this host is '
+                 '{}/{}'.format(mx.get_os(), mx.get_arch()))
+
+    base = join(svmbuild_dir(suite), 'llvm-backend-determinism')
+    mx_util.ensure_dir_exists(base)
+    # Two independent output dirs so that the temp directories produced by
+    # Native Image do not collide.
+    out_a = join(base, 'run-a')
+    out_b = join(base, 'run-b')
+    for d in (out_a, out_b):
+        if exists(d):
+            shutil.rmtree(d)
+        mx_util.ensure_dir_exists(d)
+
+    def _build_once(out_dir):
+        """Runs `helloworld` once with --tool:llvm-backend and -H:TempDirectory=out_dir.
+
+        Returns the path to the produced binary.  We use LLVMMaxFunctionsPerBatch=1
+        so that the per-function f<n>.bc files are also visible as final
+        intermediates (and not transient overwrites), which is exactly where the
+        original race manifested.
+        """
+        binary_path = join(out_dir, 'helloworld')
+        helloworld([
+            '--output-path', out_dir,
+            '--',
+            '--tool:llvm-backend',
+            '-H:TempDirectory=' + out_dir,
+        ] + svm_experimental_options(['-H:LLVMMaxFunctionsPerBatch=1']) + parsed.extra_args,
+                   config=config)
+        return binary_path
+
+    mx.log('llvm-backend-determinism: first build')
+    binary_a = _build_once(out_a)
+    mx.log('llvm-backend-determinism: second build')
+    binary_b = _build_once(out_b)
+
+    hashes_a = _hashes_under(out_a, _LLVM_BACKEND_DETERMINISM_STAGES)
+    hashes_b = _hashes_under(out_b, _LLVM_BACKEND_DETERMINISM_STAGES)
+
+    diffs = _diff_hashes('run-a', hashes_a, 'run-b', hashes_b)
+
+    # Final binary: produced outside the SVM-*/llvm/ dir by the C toolchain
+    # link step.  Hash it separately so a difference there is reported even if
+    # the LLVM intermediates all match.
+    if exists(binary_a) and exists(binary_b):
+        h_bin_a = _sha256_of_file(binary_a)
+        h_bin_b = _sha256_of_file(binary_b)
+        if h_bin_a != h_bin_b:
+            diffs.append('  - final binary differs: run-a={} vs run-b={}'.format(h_bin_a, h_bin_b))
+
+    if diffs:
+        mx.log('LLVM-backend determinism FAILED for {} files / artefacts:'.format(len(diffs)))
+        for line in diffs:
+            mx.log(line)
+        mx.log('Per-stage hashes (run-a):')
+        for k in sorted(hashes_a):
+            mx.log('  {}  {}'.format(hashes_a[k], k))
+        mx.log('Per-stage hashes (run-b):')
+        for k in sorted(hashes_b):
+            mx.log('  {}  {}'.format(hashes_b[k], k))
+        mx.abort('LLVM backend produced non-deterministic output across two identical builds. '
+                 'See the per-stage hashes above to identify the first stage where they diverge.')
+
+    mx.log('LLVM-backend determinism OK: {} intermediate artefacts and the final '
+           'binary hash identically across two independent builds.'.format(len(hashes_a)))
+
+    if not parsed.keep_output:
+        shutil.rmtree(out_a, ignore_errors=True)
+        shutil.rmtree(out_b, ignore_errors=True)
 
 
 @mx.command(suite_name=suite.name, command_name='hellomodule')
