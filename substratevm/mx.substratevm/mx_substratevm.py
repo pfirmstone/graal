@@ -2558,39 +2558,61 @@ def helloworld(args, config=None):
 # predicate matches a filename to its stage (since 'f*.bc' would also match
 # 'f0o.bc' under glob); the order of evaluation is significant.
 #
-# Pipeline (mirrors LLVMNativeImageCodeCache.layoutMethods):
-#   1. f<n>.bc     per-function bitcode emitted by writeBitcode
-#                  (the AtomicInteger race used to live here)
-#   2. b<n>.bc     linked batches produced by createBitcodeBatches
-#                  (skipped when LLVMMaxFunctionsPerBatch=1)
-#   3. b<n>o.bc    optimised batches produced by compileBitcodeBatches
-#                  via llvmOptimize
-#   4. b<n>.o      compiled batches produced by compileBitcodeBatches
-#                  via llvmCompile
-#   5. llvm.o      final relocatable object emitted by linkCompiledBatches
-#   6. <image>     final native binary produced by the C toolchain link step
+# Pipeline (mirrors LLVMNativeImageCodeCache.getBatchBitcodeFilename and
+# friends -- the file-name prefix depends on whether batching is on):
+#
+#   With LLVMMaxFunctionsPerBatch>1 (default for production builds):
+#       1. f<n>.bc     per-function bitcode emitted by writeBitcode
+#                      (the AtomicInteger race used to live here)
+#       2. b<n>.bc     linked batches (createBitcodeBatches via llvm-link)
+#       3. b<n>o.bc    optimised batches (compileBitcodeBatches via opt)
+#       4. b<n>.o      compiled batches (compileBitcodeBatches via llc)
+#
+#   With LLVMMaxFunctionsPerBatch=1 (which the gate forces, so f<n>.bc
+#   survives as a distinct artefact rather than being overwritten):
+#       1. f<n>.bc     per-function raw bitcode (writeBitcode)
+#       2. (skipped -- no batching)
+#       3. f<n>o.bc    per-function optimised bitcode (opt)
+#       4. f<n>.o      per-function compiled object (llc)
+#
+#   In both modes:
+#       5. llvm.o      final relocatable object (linkCompiledBatches via lld)
+#       6. <image>     final native binary (C toolchain link)
+#
+# The predicates below cover BOTH naming schemes, so the same stage label is
+# used regardless of whether batching is on.
 
 _LLVM_BACKEND_DETERMINISM_STAGES = (
-    ('f*.bc',  1, 'per-function bitcode (writeBitcode)',
-     lambda name: name.startswith('f') and name.endswith('.bc') and 'o.bc' not in name),
-    ('b*.bc',  2, 'linked batches (createBitcodeBatches via llvm-link)',
-     lambda name: name.startswith('b') and name.endswith('.bc') and 'o.bc' not in name),
-    ('b*o.bc', 3, 'optimised batches (compileBitcodeBatches via opt)',
-     lambda name: name.startswith('b') and name.endswith('o.bc')),
-    ('b*.o',   4, 'compiled batches (compileBitcodeBatches via llc)',
-     lambda name: name.startswith('b') and name.endswith('.o')),
+    # Glob pattern, order, label, predicate.  Predicates are evaluated in
+    # order; the first match wins.  Order matters because 'f<n>o.bc' is also
+    # a 'f*.bc' under shell glob: the optimised-bitcode check has to come
+    # before the raw-bitcode check.
+    ('*o.bc', 3, 'optimised per-function/batch bitcode (opt)',
+     lambda name: name.endswith('o.bc')),
+    ('f*.bc', 1, 'per-function raw bitcode (writeBitcode)',
+     lambda name: name.startswith('f') and name.endswith('.bc')),
+    ('b*.bc', 2, 'linked batches (createBitcodeBatches via llvm-link)',
+     lambda name: name.startswith('b') and name.endswith('.bc')),
+    ('f*.o',  4, 'compiled per-function/batch object (llc)',
+     lambda name: (name.startswith('f') or name.startswith('b'))
+                  and name.endswith('.o') and name != 'llvm.o'),
     ('llvm.o', 5, 'final relocatable object (linkCompiledBatches via lld)',
      lambda name: name == 'llvm.o'),
 )
+
+# The glob patterns used by _hashes_under to find artefacts on disk.
+# These intentionally overlap (e.g. 'f*.bc' captures both f<n>.bc and
+# f<n>o.bc); deduplication happens via the dict the function returns.
+_LLVM_BACKEND_DETERMINISM_GLOBS = ('f*.bc', 'b*.bc', 'f*.o', 'b*.o', 'llvm.o')
 
 _LLVM_BACKEND_FINAL_BINARY_STAGE = (6, 'final native binary (C toolchain link)')
 
 
 def _classify_stage(relative_path):
     """Returns (stage_order, stage_label) for an SVM-*/llvm-relative filename,
-    or (99, 'unknown') for files we don't recognise.  The first matching
-    predicate wins; predicates are ordered to disambiguate f<n>.bc from
-    f<n>o.bc-style names."""
+    or (99, 'unknown ...') for files we don't recognise.  The first matching
+    predicate wins; predicates are ordered to disambiguate f<n>o.bc from
+    f<n>.bc-style names."""
     base = os.path.basename(relative_path)
     for _pat, order, label, pred in _LLVM_BACKEND_DETERMINISM_STAGES:
         if pred(base):
@@ -2611,9 +2633,7 @@ def _hashes_under(tempdir):
     """
     Returns {relative_path: sha256_hex} for every LLVM-stage artefact under
     the single ``SVM-*/llvm/`` directory that Native Image creates inside
-    ``tempdir``.  Files are matched via the per-stage glob patterns in
-    ``_LLVM_BACKEND_DETERMINISM_STAGES``.  Filenames are sorted so the
-    returned mapping is canonical.
+    ``tempdir``.  Filenames are sorted so the returned mapping is canonical.
     """
     llvm_dirs = glob(join(tempdir, 'SVM-*', 'llvm'))
     if len(llvm_dirs) != 1:
@@ -2621,9 +2641,11 @@ def _hashes_under(tempdir):
             tempdir, llvm_dirs))
     llvm_dir = llvm_dirs[0]
     results = {}
-    for pat, _order, _label, _pred in _LLVM_BACKEND_DETERMINISM_STAGES:
+    for pat in _LLVM_BACKEND_DETERMINISM_GLOBS:
         for path in sorted(glob(join(llvm_dir, pat))):
-            results[os.path.relpath(path, llvm_dir)] = _sha256_of_file(path)
+            rel = os.path.relpath(path, llvm_dir)
+            if rel not in results:
+                results[rel] = _sha256_of_file(path)
     return results
 
 
@@ -2762,34 +2784,71 @@ def llvm_backend_determinism_test(args, config=None):
         diffs.sort(key=lambda d: (d[0], d[2]))
         first_order, first_stage_label, _msg = diffs[0]
 
-        mx.log('=' * 72)
-        mx.log('LLVM-backend determinism FAILED ({} variant, {} differences)'.format(
+        # ---- Compact per-stage summary ----------------------------------
+        # Count how many files in each stage went into run-a / run-b vs how
+        # many of those differed.  This is the bird's-eye view: it answers
+        # "is this 1 file diverging or 1000?" before the developer reads any
+        # individual filenames.
+        from collections import defaultdict
+        from itertools import groupby
+
+        stage_totals = defaultdict(lambda: {'a': 0, 'b': 0, 'diff': 0})
+        for path in set(hashes_a) | set(hashes_b):
+            order, lbl = _classify_stage(path)
+            key = (order, lbl)
+            if path in hashes_a: stage_totals[key]['a'] += 1
+            if path in hashes_b: stage_totals[key]['b'] += 1
+        for order, lbl, _msg in diffs:
+            stage_totals[(order, lbl)]['diff'] += 1
+
+        mx.log('=' * 78)
+        mx.log('LLVM-backend determinism FAILED ({} variant): {} divergent file(s)'.format(
             label, len(diffs)))
-        mx.log('=' * 72)
+        mx.log('=' * 78)
         mx.log('')
-        mx.log('First divergent stage: #{} - {}'.format(first_order, first_stage_label))
+        mx.log('First divergent stage: #{} -- {}'.format(first_order, first_stage_label))
+        mx.log('  (this is the root cause; later stages are downstream symptoms)')
         mx.log('')
-        mx.log('  This is the root cause; any divergences at later stages are')
-        mx.log('  downstream consequences of the same nondeterminism source.')
-        mx.log('  Investigate the producer of stage #{} before chasing the rest.'.format(first_order))
+        mx.log('Per-stage breakdown:')
+        mx.log('  {:>5s}  {:>5s}  {:>5s}  {:<6s}  {}'.format('#', 'run-a', 'run-b', 'diff', 'stage'))
+        for (order, lbl), counts in sorted(stage_totals.items()):
+            marker = '<-- FIRST' if order == first_order and counts['diff'] else ''
+            mx.log('  {:>5d}  {:>5d}  {:>5d}  {:>5d}   {}  {}'.format(
+                order, counts['a'], counts['b'], counts['diff'], lbl, marker))
         mx.log('')
 
-        # Group diff messages by stage so the developer sees the picture per stage.
-        from itertools import groupby
-        for stage_order, group in groupby(diffs, key=lambda d: (d[0], d[1])):
-            order, lbl = stage_order
+        # ---- Per-stage diff details, capped to avoid log spam ------------
+        # Show every diff for the first divergent stage (it's the root cause
+        # and the developer wants every clue) but cap downstream stages so a
+        # 1000-function helloworld doesn't dump 2000 lines.
+        MAX_DIFFS_DOWNSTREAM = 5
+        for stage_key, group in groupby(diffs, key=lambda d: (d[0], d[1])):
+            order, lbl = stage_key
             grp = list(group)
-            mx.log('Stage #{} ({}): {} difference(s)'.format(order, lbl, len(grp)))
-            for _o, _l, msg in grp:
+            is_first = (order == first_order)
+            mx.log('Stage #{} ({}): {} difference(s){}'.format(
+                order, lbl, len(grp), '  [ROOT CAUSE]' if is_first else ''))
+            shown = grp if is_first else grp[:MAX_DIFFS_DOWNSTREAM]
+            for _o, _l, msg in shown:
                 mx.log(msg)
+            if not is_first and len(grp) > MAX_DIFFS_DOWNSTREAM:
+                mx.log('  ... and {} more at stage #{} (truncated; see uploaded artefacts)'.format(
+                    len(grp) - MAX_DIFFS_DOWNSTREAM, order))
             mx.log('')
 
-        mx.log('Per-stage hashes (run-a):')
-        for k in sorted(hashes_a):
-            mx.log('  {}  {}'.format(hashes_a[k], k))
-        mx.log('Per-stage hashes (run-b):')
-        for k in sorted(hashes_b):
-            mx.log('  {}  {}'.format(hashes_b[k], k))
+        # Full hash tables go to a file in the output dir, not to the log.
+        # 2000+ hash lines in a CI log is unreadable; the artefact upload
+        # carries the data for forensic diff anyway.
+        try:
+            for runlabel, htab in (('run-a', hashes_a), ('run-b', hashes_b)):
+                hash_dump_path = join(base, runlabel + '-hashes.txt')
+                with open(hash_dump_path, 'w') as fp:
+                    for k in sorted(htab):
+                        fp.write('{}  {}\n'.format(htab[k], k))
+                mx.log('Wrote full hash table to {}'.format(hash_dump_path))
+        except (IOError, OSError) as e:
+            mx.log('Could not write hash dump file: {}'.format(e))
+
         mx.abort('LLVM backend produced non-deterministic output across two identical builds. '
                  'See the "First divergent stage" banner above for the root cause.')
 

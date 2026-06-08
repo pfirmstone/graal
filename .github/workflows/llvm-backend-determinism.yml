@@ -188,11 +188,12 @@ jobs:
           # svmbuild_dir(suite) in mx_substratevm.py resolves to
           # suite.get_output_root()/svmbuild, and get_output_root() is
           #     <suite.dir>/mxbuild/jdk<release>[+<release>]*
-          # ... so the determinism dirs land under
+          # ... so the determinism dirs and the run-{a,b}-hashes.txt
+          # full-hash dumps land under
           #     substratevm/mxbuild/jdk*/svmbuild/llvm-backend-determinism-*/
           # The double-glob picks up whichever JDK release directory mx
           # decided to use, plus either variant's output.
           path: |
-            substratevm/mxbuild/**/svmbuild/llvm-backend-determinism-*/
+            substratevm/mxbuild/**/svmbuild/llvm-backend-determinism-*/**
           if-no-files-found: warn
           retention-days: 7

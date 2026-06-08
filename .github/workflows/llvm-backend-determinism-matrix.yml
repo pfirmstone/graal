@@ -194,8 +194,10 @@ jobs:
           name: llvm-backend-determinism-${{ matrix.host }}-${{ matrix.variant && 'debug' || 'default' }}
           # svmbuild_dir(suite) actually resolves to
           # substratevm/mxbuild/jdk<release>/svmbuild, not substratevm/svmbuild.
+          # Recurse into the variant dir so the run-{a,b}-hashes.txt full
+          # hash dumps come with us too.
           path: |
-            substratevm/mxbuild/**/svmbuild/llvm-backend-determinism-*/
+            substratevm/mxbuild/**/svmbuild/llvm-backend-determinism-*/**
           if-no-files-found: warn
           retention-days: 14
 
