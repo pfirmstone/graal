@@ -2685,6 +2685,104 @@ def _llvm_backend_supported_here():
     return False
 
 
+def _find_llvm_bin(tool):
+    """Locate an llvm tool ('llvm-dis', 'diff', ...) on PATH or in the
+    GraalVM LLVM toolchain layout.  Returns the absolute path or None."""
+    # Prefer the toolchain that the build itself just produced; falling back
+    # to PATH (host llvm, used by macOS where llvm is installed via brew).
+    candidates = []
+    graalvm_home = os.environ.get('GRAALVM_HOME')
+    if graalvm_home:
+        candidates.append(join(graalvm_home, 'lib', 'svm', 'llvm-bin', tool))
+        candidates.append(join(graalvm_home, 'lib', 'llvm', 'bin', tool))
+    candidates.append(shutil.which(tool))
+    for c in candidates:
+        if c and exists(c):
+            return c
+    return None
+
+
+def _dump_ir_diffs(out_a, out_b, diffs, first_order, base, max_files=3, max_lines_per_diff=80):
+    """For up to ``max_files`` bitcode files in the first divergent stage,
+    disassemble both copies with llvm-dis and write a unified diff to a
+    .diff file in ``base``, also echoing a truncated head to the log.
+
+    Failure to find llvm-dis is non-fatal: the gate still aborts on the
+    hash divergence below; this is purely diagnostic."""
+    llvm_dis = _find_llvm_bin('llvm-dis')
+    if not llvm_dis:
+        mx.log('(skipping IR-level diff: llvm-dis not found on PATH or in '
+               'GRAALVM_HOME; install via the LLVM toolchain component or '
+               'brew install llvm)')
+        return
+
+    # Locate the run-a / run-b SVM-* dirs.
+    llvm_dir_a = glob(join(out_a, 'SVM-*', 'llvm'))
+    llvm_dir_b = glob(join(out_b, 'SVM-*', 'llvm'))
+    if len(llvm_dir_a) != 1 or len(llvm_dir_b) != 1:
+        return
+    llvm_dir_a, llvm_dir_b = llvm_dir_a[0], llvm_dir_b[0]
+
+    # Pick the bitcode files in the first divergent stage.
+    diverging_bc = []
+    for order, _lbl, msg in diffs:
+        if order != first_order:
+            continue
+        # msg format: "  - 'NAME' differs: ..."
+        m = re.search(r"'([^']+\.bc)'", msg)
+        if m:
+            diverging_bc.append(m.group(1))
+            if len(diverging_bc) >= max_files:
+                break
+
+    if not diverging_bc:
+        return
+
+    mx.log('')
+    mx.log('---- IR-level diff (first {} of {} diverging bitcode files) ----'.format(
+        len(diverging_bc), sum(1 for o, _l, _m in diffs if o == first_order)))
+
+    for name in diverging_bc:
+        bc_a = join(llvm_dir_a, name)
+        bc_b = join(llvm_dir_b, name)
+        ll_a = join(base, 'a-' + name + '.ll')
+        ll_b = join(base, 'b-' + name + '.ll')
+        diff_path = join(base, name + '.diff')
+        try:
+            mx.run([llvm_dis, '-o', ll_a, bc_a])
+            mx.run([llvm_dis, '-o', ll_b, bc_b])
+        except Exception as e:
+            mx.log('  llvm-dis failed on {}: {}'.format(name, e))
+            continue
+
+        # Compute the unified diff in pure Python so we don't depend on
+        # GNU diff being present (macOS ships BSD diff with slightly
+        # different exit semantics).
+        import difflib
+        with open(ll_a, 'r', encoding='utf-8', errors='replace') as fp_a, \
+             open(ll_b, 'r', encoding='utf-8', errors='replace') as fp_b:
+            diff_lines = list(difflib.unified_diff(
+                fp_a.readlines(), fp_b.readlines(),
+                fromfile='run-a/' + name + '.ll',
+                tofile='run-b/' + name + '.ll',
+                n=2))
+
+        with open(diff_path, 'w', encoding='utf-8') as fp:
+            fp.writelines(diff_lines)
+
+        mx.log('')
+        mx.log('  --- diff for {} ({} lines, full diff at {}) ---'.format(
+            name, len(diff_lines), diff_path))
+        for line in diff_lines[:max_lines_per_diff]:
+            # mx.log already adds a newline.
+            mx.log('  ' + line.rstrip())
+        if len(diff_lines) > max_lines_per_diff:
+            mx.log('  ... ({} more lines truncated, see {} in uploaded artefact)'.format(
+                len(diff_lines) - max_lines_per_diff, os.path.basename(diff_path)))
+
+    mx.log('')
+
+
 @mx.command(suite_name=suite.name, command_name='llvm-backend-determinism-test',
             usage_msg='[--keep-output] [--with-debug-info] [<extra native-image args>...]')
 def llvm_backend_determinism_test(args, config=None):
@@ -2783,6 +2881,15 @@ def llvm_backend_determinism_test(args, config=None):
         # stages are downstream symptoms of the same race / bug.
         diffs.sort(key=lambda d: (d[0], d[2]))
         first_order, first_stage_label, _msg = diffs[0]
+
+        # ---- IR-level diff of the first few diverging bitcode files ----
+        # When the first divergent stage is bitcode (stage 1 or 3), run
+        # llvm-dis on both copies and unified-diff the resulting LLVM IR.
+        # The textual diff tells us *what* differs (value names? type ids?
+        # metadata? source paths?) which the byte hash does not.  Capped
+        # at 3 files and ~60 lines of diff each so we don't flood the log.
+        if first_order in (1, 3):
+            _dump_ir_diffs(out_a, out_b, diffs, first_order, base)
 
         # ---- Compact per-stage summary ----------------------------------
         # Count how many files in each stage went into run-a / run-b vs how

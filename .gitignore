@@ -59,3 +59,9 @@ visualizer/C1Visualizer/*/target/
 *.interp
 *.tokens
 /vm/tests/gh_workflows/CDTInspectorTest/target/
+
+# Local determinism-test output drops captured during development; the
+# llvm-backend-determinism-test mx command writes its forensic artefacts
+# to substratevm/mxbuild/.../svmbuild/ (already covered by mxbuild/),
+# but developers occasionally save copies at the repo root.
+/Deterministic*.txt
