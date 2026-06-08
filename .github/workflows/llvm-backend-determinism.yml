@@ -1,0 +1,191 @@
+#
+# Copyright (c) 2026, the Pack200-ex-openjdk / DirtyChai contributors.
+# All rights reserved.
+#
+# The Universal Permissive License (UPL), Version 1.0
+#
+# Subject to the condition set forth below, permission is hereby granted to any
+# person obtaining a copy of this software, associated documentation and/or
+# data (collectively the "Software"), free of charge and under any and all
+# copyright rights in the Software, and any and all patent rights owned or
+# freely licensable by each licensor hereunder covering either (i) the
+# unmodified Software as contributed to or provided by such licensor, or (ii)
+# the Larger Works (as defined below), to deal in both
+#
+# (a) the Software, and
+#
+# (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if
+# one is included with the Software each a "Larger Work" to which the Software
+# is contributed by such licensors),
+#
+# without restriction, including without limitation the rights to copy, create
+# derivative works of, display, perform, and distribute the Software and make,
+# use, sell, offer for sale, import, export, have made, and have sold the
+# Software and the Larger Work(s), and to sublicense the foregoing rights on
+# either these or other terms.
+#
+# This license is subject to the following condition:
+#
+# The above copyright notice and either this complete permission notice or at a
+# minimum a reference to the UPL must be included in all copies or substantial
+# portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# -----------------------------------------------------------------------------
+#
+# Reproducible-build gate for the Native Image LLVM backend.
+#
+# What this workflow does
+# -----------------------
+#   1. Builds GraalVM CE for JDK with the LLVM backend tool component enabled
+#      (--components 'Native Image,Native Image LLVM Backend').
+#   2. Runs `mx llvm-backend-determinism-test`, which compiles a trivial
+#      HelloWorld twice with `--tool:llvm-backend -H:TempDirectory=<dir>` and
+#      asserts byte-for-byte equality of every intermediate LLVM artefact
+#      (f*.bc, b*.bc, b*o.bc, b*.o, llvm.o) and of the final native binary.
+#   3. On failure, the per-stage hash lists from both runs are dumped so that
+#      any future regression is diagnosed at the boundary where it first
+#      appears.
+#
+# Why this exists
+# ---------------
+#   Until commit 197c7aa, LLVMNativeImageCodeCache.writeBitcode assigned the
+#   per-function bitcode file id from inside a parallel BatchExecutor
+#   runnable via AtomicInteger.incrementAndGet(). Because the executor runs
+#   its tasks in parallel, the id was determined by thread-scheduling order
+#   rather than by source order, so the `f<n>.bc <-> method` mapping varied
+#   between runs of the same build, and the final `llvm.o` differed
+#   byte-for-byte across builds of the same source. That defeated
+#   reproducible-build / SCAP-style content-addressing of native artefacts
+#   produced via the LLVM IR pipeline.
+#
+#   The fix dispatches via BatchExecutor.forEach(int, IntFunction) instead,
+#   so each runnable receives its list index deterministically. This
+#   workflow guards that property mechanically.
+#
+# Host requirements
+# -----------------
+#   The LLVM backend is only built on Linux amd64/aarch64/riscv64 and macOS
+#   amd64/aarch64. This workflow targets ubuntu-22.04 (x86_64) because
+#   that matches the LLVM_TOOLCHAIN distribution the build will download.
+
+name: LLVM Backend Determinism
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'substratevm/src/com.oracle.svm.core.graal.llvm/**'
+      - 'substratevm/mx.substratevm/mx_substratevm.py'
+      - '.github/workflows/llvm-backend-determinism.yml'
+  pull_request:
+    paths:
+      - 'substratevm/src/com.oracle.svm.core.graal.llvm/**'
+      - 'substratevm/mx.substratevm/mx_substratevm.py'
+      - '.github/workflows/llvm-backend-determinism.yml'
+  workflow_dispatch:
+    inputs:
+      extra-native-image-args:
+        description: 'Extra arguments forwarded to native-image (e.g. -O1)'
+        default: ''
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llvm-backend-determinism-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  determinism:
+    name: Build + LLVM backend determinism check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout graal
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up environment variables
+        shell: bash
+        run: |
+          echo "GRAALVM_HOME=${{ github.workspace }}/graalvm" >> ${GITHUB_ENV}
+          echo "JAVA_HOME=${{ github.workspace }}/labsjdk" >> ${GITHUB_ENV}
+          echo "MX_GIT_CACHE=refcache" >> ${GITHUB_ENV}
+          echo "MX_PATH=${{ github.workspace }}/mx" >> ${GITHUB_ENV}
+          echo "MX_PYTHON=python3.8" >> ${GITHUB_ENV}
+          echo "MX_VERSION=$(jq -r '.mx_version' common.json)" >> ${GITHUB_ENV}
+          echo "LANG=en_US.UTF-8" >> ${GITHUB_ENV}
+
+      - name: Checkout graalvm/mx
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: graalvm/mx
+          ref: ${{ env.MX_VERSION }}
+          path: ${{ env.MX_PATH }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.8'
+
+      - name: Fetch LabsJDK
+        shell: bash
+        run: |
+          mkdir jdk-dl
+          ${MX_PATH}/mx --java-home= fetch-jdk --jdk-id labsjdk-ce-latest --to jdk-dl --alias ${JAVA_HOME}
+
+      - name: Build GraalVM with LLVM backend enabled
+        shell: bash
+        run: |
+          cd vm
+          MX_ARGS=(
+            "--java-home" "${JAVA_HOME}"
+            "--dy" "/substratevm"
+            "--native-images=native-image"
+            "--components=Native Image,Native Image LLVM Backend"
+          )
+          ${MX_PATH}/mx "${MX_ARGS[@]}" build
+          ln -s "$(${MX_PATH}/mx "${MX_ARGS[@]}" graalvm-home)" "${GRAALVM_HOME}"
+
+      - name: Show GraalVM version info
+        shell: bash
+        run: |
+          echo "= 'java --version' ============"
+          "${GRAALVM_HOME}/bin/java" --version
+          echo "==============================="
+          echo "= 'native-image --version' ===="
+          "${GRAALVM_HOME}/bin/native-image" --version
+          echo "==============================="
+          echo "= LLVM toolchain present? ====="
+          ls -la "${GRAALVM_HOME}/lib/svm/llvm-bin/" 2>/dev/null \
+            | head -20 \
+            || echo "(llvm-bin not at the expected path; checking module layer instead)"
+          echo "==============================="
+
+      - name: Run llvm-backend-determinism-test
+        shell: bash
+        run: |
+          cd substratevm
+          ${MX_PATH}/mx --java-home "${JAVA_HOME}" --dy /substratevm \
+            llvm-backend-determinism-test \
+            ${{ github.event.inputs.extra-native-image-args || '' }}
+
+      - name: Upload temp dirs on failure for forensic inspection
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: llvm-backend-determinism-artefacts
+          path: |
+            substratevm/svmbuild/llvm-backend-determinism/
+          if-no-files-found: ignore
+          retention-days: 7
