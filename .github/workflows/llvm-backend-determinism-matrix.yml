@@ -104,14 +104,17 @@ jobs:
       fail-fast: false   # one platform's failure must not hide another's pass
       matrix:
         # Host runners supported by GitHub Actions today on which the
-        # Native Image LLVM backend can be built (Linux amd64, macOS amd64,
-        # macOS arm64).  Each host runs both the default and the
-        # --with-debug-info variant so a debug-DWARF regression is caught
-        # separately from a base-pipeline regression.
+        # Native Image LLVM backend can be built.  Each host runs both
+        # the default and the --with-debug-info variant so a debug-DWARF
+        # regression is caught separately from a base-pipeline regression.
+        #
+        # macos-13 (x86_64) was deliberately dropped: GitHub has retired
+        # public macos-13 runners.  Apple Silicon macos-14 covers the
+        # Darwin ARM path; Darwin x86_64 LLVM-backend coverage would need
+        # a self-hosted runner.
         host:
           - ubuntu-22.04
           - ubuntu-24.04
-          - macos-13          # x86_64
           - macos-14          # Apple Silicon (arm64)
         variant:
           - ''                # default
@@ -189,9 +192,11 @@ jobs:
         with:
           # Disambiguate so all matrix cells can upload without collision.
           name: llvm-backend-determinism-${{ matrix.host }}-${{ matrix.variant && 'debug' || 'default' }}
+          # svmbuild_dir(suite) actually resolves to
+          # substratevm/mxbuild/jdk<release>/svmbuild, not substratevm/svmbuild.
           path: |
-            substratevm/svmbuild/llvm-backend-determinism-*/
-          if-no-files-found: ignore
+            substratevm/mxbuild/**/svmbuild/llvm-backend-determinism-*/
+          if-no-files-found: warn
           retention-days: 14
 
   summary:

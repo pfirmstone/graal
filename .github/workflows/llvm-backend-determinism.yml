@@ -185,11 +185,14 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: llvm-backend-determinism-artefacts
-          # The mx command emits two siblings, one per variant:
-          #   svmbuild/llvm-backend-determinism-default/{run-a,run-b}
-          #   svmbuild/llvm-backend-determinism-with-debug-info/{run-a,run-b}
-          # The wildcard picks up whichever was produced.
+          # svmbuild_dir(suite) in mx_substratevm.py resolves to
+          # suite.get_output_root()/svmbuild, and get_output_root() is
+          #     <suite.dir>/mxbuild/jdk<release>[+<release>]*
+          # ... so the determinism dirs land under
+          #     substratevm/mxbuild/jdk*/svmbuild/llvm-backend-determinism-*/
+          # The double-glob picks up whichever JDK release directory mx
+          # decided to use, plus either variant's output.
           path: |
-            substratevm/svmbuild/llvm-backend-determinism-*/
+            substratevm/mxbuild/**/svmbuild/llvm-backend-determinism-*/
           if-no-files-found: warn
           retention-days: 7
