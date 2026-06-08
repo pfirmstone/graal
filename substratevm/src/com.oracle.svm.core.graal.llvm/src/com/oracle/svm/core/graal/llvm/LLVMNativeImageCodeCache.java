@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -67,7 +67,6 @@ import com.oracle.svm.core.graal.llvm.util.LLVMObjectFileReader.LLVMTextSectionI
 import com.oracle.svm.core.graal.llvm.util.LLVMOptions;
 import com.oracle.svm.core.graal.llvm.util.LLVMStackMapInfo;
 import com.oracle.svm.core.heap.SubstrateReferenceMap;
-import com.oracle.svm.core.jdk.UninterruptibleUtils.AtomicInteger;
 import com.oracle.svm.guest.staging.c.CGlobalDataImpl;
 import com.oracle.svm.hosted.NativeImageOptions;
 import com.oracle.svm.hosted.image.NativeImage;
@@ -146,10 +145,31 @@ public class LLVMNativeImageCodeCache extends NativeImageCodeCache {
     }
 
     private void writeBitcode(BatchExecutor executor) {
-        methodIndex = new HostedMethod[getOrderedCompilations().size()];
-        AtomicInteger num = new AtomicInteger(-1);
-        executor.forEach(getOrderedCompilations(), pair -> _ -> {
-            int id = num.incrementAndGet();
+        /*
+         * The per-function bitcode file id MUST be derived from the position of
+         * the compilation in {@code getOrderedCompilations()}, NOT from an
+         * AtomicInteger counter incremented inside the parallel runnable.
+         *
+         * The earlier implementation used {@code num.incrementAndGet()} from
+         * within the body of the runnable submitted to {@link BatchExecutor},
+         * which executes its tasks in parallel via {@link CompletionExecutor}.
+         * The counter therefore returned a value determined by thread-
+         * scheduling order, so the mapping {@code methodIndex[id] -> method}
+         * (and the contents of {@code f<id>.bc}) varied between otherwise
+         * identical builds.  That non-determinism then propagated through the
+         * batch link / opt / llc stages (different functions landed in
+         * different batches, optimised in different orders) and ultimately
+         * produced different {@code llvm.o} bytes on every run, defeating any
+         * attempt at reproducible builds that include the LLVM backend.
+         *
+         * Using {@link BatchExecutor#forEach(int, IntFunction)} keeps the
+         * outer loop sequential (and therefore deterministic) while still
+         * parallelising the per-file work inside the runnable.
+         */
+        List<Pair<HostedMethod, CompilationResult>> compilations = getOrderedCompilations();
+        methodIndex = new HostedMethod[compilations.size()];
+        executor.forEach(compilations.size(), id -> _ -> {
+            Pair<HostedMethod, CompilationResult> pair = compilations.get(id);
             methodIndex[id] = pair.getLeft();
 
             try (FileOutputStream fos = new FileOutputStream(getBitcodePath(id).toString())) {
