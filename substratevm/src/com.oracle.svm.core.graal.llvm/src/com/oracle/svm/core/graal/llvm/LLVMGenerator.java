@@ -123,6 +123,7 @@ import jdk.graal.compiler.core.common.type.IllegalStamp;
 import jdk.graal.compiler.core.common.type.RawPointerStamp;
 import jdk.graal.compiler.core.common.type.Stamp;
 import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.debug.GraalError;
 import jdk.graal.compiler.graph.Node;
 import jdk.graal.compiler.lir.LIRFrameState;
 import jdk.graal.compiler.lir.LIRInstruction;
