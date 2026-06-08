@@ -50,8 +50,6 @@ import java.util.Map;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
-import com.oracle.svm.core.meta.SharedMethod;
-
 import org.graalvm.collections.Pair;
 import org.graalvm.nativeimage.c.constant.CEnum;
 import org.graalvm.nativeimage.c.function.CEntryPoint;
@@ -91,6 +89,7 @@ import com.oracle.svm.core.graal.nodes.WriteCodeBaseNode;
 import com.oracle.svm.core.graal.nodes.WriteCurrentVMThreadNode;
 import com.oracle.svm.core.graal.nodes.WriteHeapBaseNode;
 import com.oracle.svm.core.heap.ReferenceAccess;
+import com.oracle.svm.core.meta.SharedMethod;
 import com.oracle.svm.core.meta.SubstrateMethodRefStamp;
 import com.oracle.svm.core.snippets.SnippetRuntime;
 import com.oracle.svm.hosted.code.CEntryPointData;
@@ -203,11 +202,13 @@ public class LLVMGenerator extends CoreProvidersDelegate implements LIRGenerator
         this.isEntryPoint = isEntryPoint(method);
         this.modifiesSpecialRegisters = modifiesSpecialRegisters(graph);
 
-        // Pre-assigned deterministic patchpoint-id base for this method.
-        // See the long comment on PATCHPOINT_BLOCK_BITS / methodPatchpointBases
-        // above for the rationale.
-        this.patchpointBase = initialPatchpointIdFor(method);
-        this.nextPatchpointIdLocal = this.patchpointBase;
+        // Pre-assigned deterministic patchpoint-id index for this method.
+        // See the long comment on methodPatchpointIndices above for the
+        // column-major id scheme (id = methodIndex + k * methodCount) and
+        // why it is used instead of fixed per-method blocks.
+        this.patchpointMethodIndex = initialPatchpointIndexFor(method);
+        this.instanceStride = patchpointStride;
+        this.patchpointLocalCounter = 0;
 
         ResolvedJavaType returnType = method.getSignature().getReturnType(null).resolve(null);
         this.returnsEnum = returnType.isEnum();
@@ -1272,108 +1273,152 @@ public class LLVMGenerator extends CoreProvidersDelegate implements LIRGenerator
      * per-function {@code f<n>.bc} files differed in our reproducibility
      * gate (see {@code mx llvm-backend-determinism-test}).
      *
-     * <p>The fix is to assign each method a deterministic base before
-     * compilation starts and have each {@link LLVMGenerator} consume from a
-     * per-instance counter that starts at its method's base.  Per-method
-     * compilation is single-threaded inside a {@link LLVMGenerator} instance,
-     * so no atomic is required; cross-method parallelism is preserved.
+     * <p>The fix assigns each method a deterministic index before compilation
+     * starts and has each {@link LLVMGenerator} derive its call-site ids from
+     * {@code methodIndex + localCounter * methodCount}.  Per-method
+     * compilation is single-threaded inside one {@link LLVMGenerator}
+     * instance, so the local counter needs no atomic; cross-method
+     * parallelism is preserved.
      *
-     * <p>{@link #initializePatchpointBases} is invoked from
-     * {@link LLVMFeature#beforeCompilation} after {@link HostedUniverse} has
+     * <h4>Why {@code methodIndex + localCounter * methodCount} (column-major)
+     * and not {@code methodIndex * blockSize + localCounter} (row-major)?</h4>
+     *
+     * <p>The id must fit in a signed 31-bit {@code int}: it is squeezed
+     * through {@link jdk.graal.compiler.core.common.NumUtil#safeToInt} at the
+     * {@code recordCall} / {@code recordInfopoint} use sites (the id is stored
+     * temporarily in the {@code int pcOffset} field of an
+     * {@link jdk.vm.ci.code.site.Infopoint}).  That gives 2^31-1 ≈ 2.1e9 ids
+     * total.
+     *
+     * <p>A row-major scheme reserves a fixed block of {@code B} ids per method
+     * ({@code method[i]} owns {@code [i*B, i*B+B)}).  To never overflow a
+     * method's block you must pick {@code B} large enough for the biggest
+     * method, but then {@code methodCount * B} blows past 2^31 for any real
+     * image -- a plain HelloWorld already pulls in ~37.5K methods, so even
+     * {@code B = 65536} overflows ({@code 37572 * 65536 > 2^31}).  That is the
+     * bug this comment's commit fixes.
+     *
+     * <p>The column-major scheme {@code id = methodIndex + k * methodCount}
+     * (with {@code methodIndex in [0, methodCount)} and {@code k} the 0-based
+     * within-method counter) is dense: it wastes nothing on power-of-two
+     * rounding and lets every method use up to
+     * {@code floor((2^31-1) / methodCount)} ids.  For 37.5K methods that is
+     * ~57K patchpoints per method, far more than any real method needs (a
+     * method is capped at ~64K bytecodes, so it cannot contain anywhere near
+     * 57K call sites).
+     *
+     * <p>Global uniqueness holds by construction: if
+     * {@code i1 + k1*N == i2 + k2*N} with {@code i1,i2 in [0,N)} then
+     * {@code i1 == i2} (equal mod N) and hence {@code k1 == k2}.  The ids
+     * therefore satisfy the per-function-uniqueness assertion in
+     * {@link com.oracle.svm.core.graal.llvm.util.LLVMStackMapInfo} (a stack
+     * map is parsed per compilation batch, and global uniqueness implies
+     * per-batch uniqueness regardless of how functions are grouped into
+     * batches).  They also never collide with
+     * {@link com.oracle.svm.core.graal.llvm.util.LLVMStackMapInfo#DEFAULT_PATCHPOINT_ID}
+     * ({@code 0xABCDEF00}), which is deliberately above {@link Integer#MAX_VALUE}.
+     *
+     * <p>{@link #initializePatchpointIndices} is invoked from
+     * {@link LLVMFeature#beforeCompilation} after {@code HostedUniverse} has
      * enumerated every reachable method but before compile threads start.
-     * Methods are sorted by {@link HostedMethod#getUniqueShortName()} (the
-     * same key used elsewhere in Native Image for deterministic ordering)
-     * and assigned 16-bit-wide id blocks: method[i] owns ids in
-     * {@code [i * 65536, i * 65536 + 65535]}.  We cap the total method
-     * count so the highest id still fits in a signed {@code int} (the
-     * {@link com.oracle.graal.pointsto.util.NumUtil#safeToInt} squeeze used
-     * downstream when the id is temporarily stored as a code offset).
+     * Methods are sorted by {@link HostedMethod#getUniqueShortName()} -- the
+     * same key Native Image already uses for deterministic constant/code
+     * layout -- so the index assignment is stable across builds.  The LLVM
+     * backend does not support deoptimization
+     * ({@code emitDeoptimize} throws), so no deopt-target method variants are
+     * compiled, and every LLVM-compiled method is therefore present in
+     * {@code getMethods()}.
      */
-    private static final int PATCHPOINT_BLOCK_BITS = 16;
-    private static final int PATCHPOINT_BLOCK_SIZE = 1 << PATCHPOINT_BLOCK_BITS;
-    private static final int PATCHPOINT_MAX_METHODS = Integer.MAX_VALUE >>> PATCHPOINT_BLOCK_BITS;
 
     /**
-     * Per-method patchpoint-id base.  Populated once by
-     * {@link #initializePatchpointBases} before compile threads start, then
-     * read-only for the rest of the build.  {@code volatile} for safe
-     * publication; lookups are wait-free.
+     * Per-method deterministic index, in {@code [0, methodCount)}.  Populated
+     * once by {@link #initializePatchpointIndices} before compile threads
+     * start, then read-only.  {@code volatile} for safe publication; lookups
+     * are wait-free.
      */
-    private static volatile Map<HostedMethod, Integer> methodPatchpointBases;
+    private static volatile Map<HostedMethod, Integer> methodPatchpointIndices;
+
+    /**
+     * The id stride: the number of methods (== modulus that guarantees
+     * global id uniqueness in the column-major scheme).  Published together
+     * with {@link #methodPatchpointIndices}.
+     */
+    private static volatile int patchpointStride;
 
     /**
      * Per-instance patchpoint-id state.  Single-threaded use; no atomic
      * required because each {@link LLVMGenerator} instance is owned by one
      * compile thread for the duration of one method.
      *
-     * <p>{@code patchpointBase} is the inclusive lower bound of this method's
-     * pre-assigned 16-bit-wide id block; {@code nextPatchpointIdLocal} is the
-     * counter that starts at {@code patchpointBase} and is bumped by
-     * {@link #getAndIncrementPatchpointId}.  {@code long} only to keep the
-     * arithmetic explicit; the value is always in {@code int} range and is
-     * cast back at the use site.
+     * <p>{@code patchpointMethodIndex} is this method's stable index in
+     * {@code [0, instanceStride)}; {@code instanceStride} is the id stride
+     * captured from the static {@link #patchpointStride} at construction time
+     * (so a generator always pairs its index with the stride it was built
+     * against); {@code patchpointLocalCounter} is the 0-based within-method
+     * call-site counter consumed by {@link #getAndIncrementPatchpointId}.
      */
-    private final long patchpointBase;
-    private long nextPatchpointIdLocal;
+    private final int patchpointMethodIndex;
+    private final int instanceStride;
+    private long patchpointLocalCounter;
 
     /**
-     * Assigns each method in {@code methods} a deterministic patchpoint-id
-     * base.  Must be invoked before any {@link LLVMGenerator} is constructed
-     * for that method.  Idempotent: subsequent calls overwrite the previous
-     * mapping (intended only for test harnesses that reuse the JVM).
+     * Assigns each method in {@code methods} a deterministic index in
+     * {@code [0, methods.size())}.  Must be invoked before any
+     * {@link LLVMGenerator} is constructed.  Idempotent: a later call
+     * overwrites the previous mapping (intended only for test harnesses that
+     * reuse the JVM).
      *
      * @param methods every method that will be compiled in this build; sorted
      *                internally by {@link HostedMethod#getUniqueShortName()}
-     * @throws GraalError if there are more methods than the 31-bit positive
-     *                    int id space can accommodate at
-     *                    {@value #PATCHPOINT_BLOCK_SIZE} ids per method
-     *                    (roughly 32K methods); raise
-     *                    {@link #PATCHPOINT_BLOCK_BITS} or pre-assign
-     *                    smaller blocks if you hit this in practice
      */
-    public static void initializePatchpointBases(Collection<? extends SharedMethod> methods) {
+    public static void initializePatchpointIndices(Collection<? extends SharedMethod> methods) {
         List<HostedMethod> sorted = methods.stream()
                         .filter(m -> m instanceof HostedMethod)
                         .map(m -> (HostedMethod) m)
                         .sorted(Comparator.comparing(HostedMethod::getUniqueShortName))
                         .collect(Collectors.toList());
-        if (sorted.size() > PATCHPOINT_MAX_METHODS) {
-            throw new GraalError(
-                "LLVM backend: %d methods exceed the patchpoint id space "
-                + "(%d-method ceiling at %d ids per method).  Reduce "
-                + "LLVMGenerator.PATCHPOINT_BLOCK_BITS or rework patchpoint "
-                + "ids to span more than 31 bits.",
-                sorted.size(), PATCHPOINT_MAX_METHODS, PATCHPOINT_BLOCK_SIZE);
-        }
         Map<HostedMethod, Integer> map = new HashMap<>(sorted.size() * 2);
         for (int i = 0; i < sorted.size(); i++) {
-            map.put(sorted.get(i), i * PATCHPOINT_BLOCK_SIZE);
+            map.put(sorted.get(i), i);
         }
-        methodPatchpointBases = Collections.unmodifiableMap(map);
+        /*
+         * Publish the stride before the index map: getAndIncrementPatchpointId
+         * reads the stride captured at construction time, but a defensive
+         * ordering keeps the two static fields mutually consistent for any
+         * reader.
+         */
+        patchpointStride = Math.max(1, sorted.size());
+        methodPatchpointIndices = Collections.unmodifiableMap(map);
     }
 
     /**
      * Returns the next patchpoint id for this method and advances the
-     * per-instance counter.  Throws if the method has exceeded its
-     * {@value #PATCHPOINT_BLOCK_SIZE}-id block (in practice no real method
-     * comes close: a typical HelloWorld is fewer than 10 patchpoints per
-     * function).
+     * per-instance counter.  The id is {@code methodIndex + k * methodCount}
+     * for the 0-based within-method counter {@code k}.
+     *
+     * @throws GraalError if the id would exceed {@link Integer#MAX_VALUE} --
+     *                    only possible for a method with more than
+     *                    {@code floor(Integer.MAX_VALUE / methodCount)} call
+     *                    sites (tens of thousands), which cannot occur within
+     *                    the ~64K-bytecode method size limit
      */
     public long getAndIncrementPatchpointId() {
-        long id = nextPatchpointIdLocal++;
-        if (id >= patchpointBase + PATCHPOINT_BLOCK_SIZE) {
-            throw new GraalError("LLVM backend: method %s exceeded its %d-id "
-                                 + "patchpoint block.  Raise LLVMGenerator."
-                                 + "PATCHPOINT_BLOCK_BITS or split the method.",
-                                 functionName, PATCHPOINT_BLOCK_SIZE);
+        long id = patchpointMethodIndex + patchpointLocalCounter * (long) instanceStride;
+        patchpointLocalCounter++;
+        if (id > Integer.MAX_VALUE) {
+            throw new GraalError("LLVM backend: method %s produced a patchpoint id (%d) "
+                                 + "exceeding Integer.MAX_VALUE.  With %d methods each "
+                                 + "method may hold up to %d patchpoints; this method has "
+                                 + "more call sites than that.",
+                                 functionName, id, instanceStride, Integer.MAX_VALUE / instanceStride);
         }
         return id;
     }
 
-    private static long initialPatchpointIdFor(ResolvedJavaMethod method) {
-        Map<HostedMethod, Integer> map = methodPatchpointBases;
+    private static int initialPatchpointIndexFor(ResolvedJavaMethod method) {
+        Map<HostedMethod, Integer> map = methodPatchpointIndices;
         if (map == null) {
-            throw new GraalError("LLVMGenerator.initializePatchpointBases was "
+            throw new GraalError("LLVMGenerator.initializePatchpointIndices was "
                                  + "not invoked before compilation.  See "
                                  + "LLVMFeature.beforeCompilation.");
         }
@@ -1381,18 +1426,18 @@ public class LLVMGenerator extends CoreProvidersDelegate implements LIRGenerator
             throw new GraalError("LLVM backend: cannot allocate patchpoint ids "
                                  + "for non-HostedMethod " + method);
         }
-        Integer base = map.get(method);
-        if (base == null) {
+        Integer index = map.get(method);
+        if (index == null) {
             throw new GraalError("LLVM backend: method %s was not present in "
                                  + "the HostedUniverse at LLVMFeature."
                                  + "beforeCompilation time; cannot assign a "
-                                 + "deterministic patchpoint id base.  This "
-                                 + "usually indicates a method created after "
-                                 + "the compile queue started -- file a bug "
-                                 + "with the LLVM backend maintainers.",
+                                 + "deterministic patchpoint id.  This usually "
+                                 + "indicates a method created after the "
+                                 + "compile queue started -- file a bug with "
+                                 + "the LLVM backend maintainers.",
                                  method);
         }
-        return base.longValue();
+        return index.intValue();
     }
 
     LLVMValueRef buildStatepointCall(LLVMValueRef callee, boolean nativeABI, long statepointId, LLVMValueRef... args) {

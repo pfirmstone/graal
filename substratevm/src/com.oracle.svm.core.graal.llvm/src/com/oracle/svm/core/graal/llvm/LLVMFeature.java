@@ -141,8 +141,11 @@ public class LLVMFeature implements InternalFeature {
     @Override
     public void beforeCompilation(BeforeCompilationAccess access) {
         /*
-         * Pre-assign each HostedMethod a deterministic patchpoint-id base so
-         * that the per-function LLVM bitcode is byte-identical across builds.
+         * Pre-assign each HostedMethod a deterministic index so that the
+         * per-function LLVM bitcode is byte-identical across builds.  Call
+         * sites derive their patchpoint id as
+         * (methodIndex + localCounter * methodCount); see the long comment on
+         * LLVMGenerator.methodPatchpointIndices for the scheme and rationale.
          *
          * Before this hook existed, LLVMGenerator allocated patchpoint ids
          * from a single process-wide AtomicLong incremented from inside the
@@ -155,10 +158,12 @@ public class LLVMFeature implements InternalFeature {
          * This hook fires after HostedUniverse has enumerated every
          * reachable method and before the CompileQueue starts handing
          * methods to compile threads.  That makes it the right (and only)
-         * place to compute a stable method-to-base map.
+         * place to compute a stable method-to-index map.  The LLVM backend
+         * does not support deoptimization, so no deopt-target variants are
+         * compiled and every LLVM-compiled method is present in getMethods().
          */
         FeatureImpl.BeforeCompilationAccessImpl accessImpl = (FeatureImpl.BeforeCompilationAccessImpl) access;
-        LLVMGenerator.initializePatchpointBases(accessImpl.getMethods());
+        LLVMGenerator.initializePatchpointIndices(accessImpl.getMethods());
     }
 
     @Override
