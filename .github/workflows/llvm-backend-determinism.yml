@@ -180,8 +180,29 @@ jobs:
             llvm-backend-determinism-test \
             ${{ github.event.inputs.extra-native-image-args || '' }}
 
+      - name: Attribution -- default-backend determinism (informational)
+        # Always runs (even when the LLVM test above fails) and never fails the
+        # job.  Builds HelloWorld twice with the ORDINARY backend and compares
+        # the object files + final binary.  If the default backend is ALSO
+        # nondeterministic, the residual divergence is upstream / backend-
+        # agnostic (e.g. type-id / reachability nondeterminism) rather than an
+        # LLVM-backend regression.  The disassembly diff in the log shows what
+        # differs.
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd substratevm
+          ${MX_PATH}/mx --java-home "${JAVA_HOME}" --dy /substratevm \
+            llvm-backend-determinism-test --backend default \
+            ${{ github.event.inputs.extra-native-image-args || '' }}
+
       - name: Upload temp dirs on failure for forensic inspection
-        if: failure()
+        # Runs whenever the determinism test failed; also captures the
+        # default-backend attribution output (the informational step above
+        # never fails the job, so gate this on always() rather than failure()
+        # to make sure the default-backend artefacts come along too).
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: llvm-backend-determinism-artefacts
@@ -192,8 +213,9 @@ jobs:
           # full-hash dumps land under
           #     substratevm/mxbuild/jdk*/svmbuild/llvm-backend-determinism-*/
           # The double-glob picks up whichever JDK release directory mx
-          # decided to use, plus either variant's output.
+          # decided to use, plus every variant's output (llvm + default).
           path: |
             substratevm/mxbuild/**/svmbuild/llvm-backend-determinism-*/**
+          if-no-files-found: warn
           if-no-files-found: warn
           retention-days: 7

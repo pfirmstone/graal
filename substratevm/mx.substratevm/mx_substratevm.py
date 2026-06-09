@@ -2783,8 +2783,140 @@ def _dump_ir_diffs(out_a, out_b, diffs, first_order, base, max_files=3, max_line
     mx.log('')
 
 
+def _objdump_diff(obj_a, obj_b, base, max_lines=120):
+    """Disassembles two object files and writes a unified diff of the
+    disassembly, echoing a truncated head to the log.  Used to identify
+    *what* differs in a default-backend object file (e.g. type-id range-check
+    constants).  Non-fatal if objdump is missing."""
+    objdump = _find_llvm_bin('llvm-objdump') or shutil.which('objdump')
+    if not objdump:
+        mx.log('(skipping disassembly diff: no objdump / llvm-objdump found)')
+        return
+    # llvm-objdump and GNU objdump share -d (disassemble) and --no-show-raw-insn
+    # to drop the raw bytes (which include addresses that would add noise).
+    flags = ['-d', '--no-show-raw-insn']
+    txt = {}
+    for tag, obj in (('a', obj_a), ('b', obj_b)):
+        out = []
+        try:
+            mx.run([objdump] + flags + [obj], out=lambda s: out.append(s))
+        except Exception as e:
+            mx.log('  objdump failed on {}: {}'.format(obj, e))
+            return
+        txt[tag] = out
+    import difflib
+    diff_lines = list(difflib.unified_diff(
+        ''.join(txt['a']).splitlines(keepends=True),
+        ''.join(txt['b']).splitlines(keepends=True),
+        fromfile='run-a/' + os.path.basename(obj_a),
+        tofile='run-b/' + os.path.basename(obj_b), n=2))
+    diff_path = join(base, os.path.basename(obj_a) + '.objdump.diff')
+    with open(diff_path, 'w', encoding='utf-8') as fp:
+        fp.writelines(diff_lines)
+    mx.log('')
+    mx.log('  --- disassembly diff for {} ({} lines, full diff at {}) ---'.format(
+        os.path.basename(obj_a), len(diff_lines), diff_path))
+    for line in diff_lines[:max_lines]:
+        mx.log('  ' + line.rstrip())
+    if len(diff_lines) > max_lines:
+        mx.log('  ... ({} more lines truncated, see uploaded artefact)'.format(len(diff_lines) - max_lines))
+
+
+def _default_backend_determinism_test(parsed, config):
+    """Builds HelloWorld twice with the ordinary (non-LLVM) Native Image
+    backend and compares the emitted object file(s) and the final binary.
+
+    The point is attribution: if the default backend is ALSO nondeterministic
+    in the same way (e.g. type-id range-check constants shifting), the
+    divergence is upstream/backend-agnostic rather than an LLVM-backend bug.
+    """
+    base = join(svmbuild_dir(suite), 'llvm-backend-determinism-default-backend')
+    mx_util.ensure_dir_exists(base)
+    out_a = join(base, 'run-a')
+    out_b = join(base, 'run-b')
+    for d in (out_a, out_b):
+        if exists(d):
+            shutil.rmtree(d)
+        mx_util.ensure_dir_exists(d)
+
+    experimental = []
+    if parsed.with_debug_info:
+        experimental.append('-H:GenerateDebugInfo=1')
+
+    def _build_once(out_dir):
+        binary_path = join(out_dir, 'helloworld')
+        helloworld([
+            '--output-path', out_dir,
+            '--',
+            '-H:TempDirectory=' + out_dir,
+        ] + svm_experimental_options(experimental) + parsed.extra_args,
+                   config=config)
+        return binary_path
+
+    mx.log('default-backend-determinism: first build')
+    binary_a = _build_once(out_a)
+    mx.log('default-backend-determinism: second build')
+    binary_b = _build_once(out_b)
+
+    def _objects_under(out_dir):
+        # The ordinary backend leaves the image object file under SVM-*/ in
+        # the temp directory before the C toolchain links it.
+        result = {}
+        for path in sorted(glob(join(out_dir, 'SVM-*', '**', '*.o'), recursive=True)):
+            svm = glob(join(out_dir, 'SVM-*'))
+            relroot = svm[0] if svm else out_dir
+            result[os.path.relpath(path, relroot)] = _sha256_of_file(path)
+        return result
+
+    objs_a = _objects_under(out_a)
+    objs_b = _objects_under(out_b)
+    diffs = _diff_hashes('run-a', objs_a, 'run-b', objs_b)
+
+    bin_diff = False
+    if exists(binary_a) and exists(binary_b):
+        if _sha256_of_file(binary_a) != _sha256_of_file(binary_b):
+            bin_diff = True
+
+    mx.log('=' * 78)
+    if not diffs and not bin_diff:
+        mx.log('default-backend determinism OK: {} object file(s) and the final binary '
+               'hash identically across two builds.'.format(len(objs_a)))
+        mx.log('=' * 78)
+        if not parsed.keep_output:
+            shutil.rmtree(out_a, ignore_errors=True)
+            shutil.rmtree(out_b, ignore_errors=True)
+        return
+
+    mx.log('default-backend determinism FAILED: {} object-file diff(s){}'.format(
+        len(diffs), ' + final binary differs' if bin_diff else ''))
+    mx.log('=' * 78)
+    mx.log('')
+    mx.log('This means the divergence is NOT specific to the LLVM backend: the')
+    mx.log('ordinary backend produces nondeterministic output too, so the source')
+    mx.log('is upstream (e.g. type-id / reachability nondeterminism shared by all')
+    mx.log('backends).')
+    mx.log('')
+    for _o, _l, msg in diffs:
+        mx.log(msg)
+    if bin_diff:
+        mx.log('  - final binary differs')
+    # Disassemble the first diverging object file to show WHAT differs.
+    for _o, _l, msg in diffs:
+        m = re.search(r"'([^']+\.o)'", msg)
+        if m:
+            name = m.group(1)
+            svm_a = glob(join(out_a, 'SVM-*'))
+            svm_b = glob(join(out_b, 'SVM-*'))
+            if svm_a and svm_b:
+                _objdump_diff(join(svm_a[0], name), join(svm_b[0], name), base)
+            break
+
+    mx.abort('Default backend produced nondeterministic output; see disassembly diff above. '
+             'A divergence here is upstream, not an LLVM-backend regression.')
+
+
 @mx.command(suite_name=suite.name, command_name='llvm-backend-determinism-test',
-            usage_msg='[--keep-output] [--with-debug-info] [<extra native-image args>...]')
+            usage_msg='[--keep-output] [--with-debug-info] [--backend llvm|default] [<extra native-image args>...]')
 def llvm_backend_determinism_test(args, config=None):
     """
     Reproducible-build gate for the LLVM backend.
@@ -2808,9 +2940,21 @@ def llvm_backend_determinism_test(args, config=None):
                              'source-file paths and DWARF metadata, both common sources of '
                              'nondeterminism, so this variant is strictly stricter than the '
                              'default.')
+    parser.add_argument('--backend', choices=['llvm', 'default'], default='llvm',
+                        help='Which Native Image backend to test.  "llvm" (default) builds '
+                             'with --tool:llvm-backend and does the full per-function f*.bc '
+                             'stage analysis.  "default" builds with the ordinary backend and '
+                             'compares the emitted object file(s) and the final binary -- use '
+                             'it to check whether a divergence is LLVM-backend-specific or '
+                             'shared with the default backend (e.g. upstream type-id / '
+                             'reachability nondeterminism, which is backend-agnostic).')
     parser.add_argument('extra_args', nargs='*', default=[],
                         help='Extra arguments forwarded to native-image (e.g. -O1)')
     parsed = parser.parse_args(args)
+
+    if parsed.backend == 'default':
+        _default_backend_determinism_test(parsed, config)
+        return
 
     if not _llvm_backend_supported_here():
         mx.abort('llvm-backend-determinism-test is only supported on Linux '
