@@ -1,0 +1,245 @@
+# Native Image Reproducibility — master task DAG
+# Source of truth. Validated by schema/tasks.schema.json.
+# Only stage 0 prompts exist up front; stages 1+ are emitted by review gates (R0..R4).
+meta:
+  program: native-image-reproducibility
+  version: 1
+  created: 2026-06-09
+  origin: "LLVM-backend determinism investigation (197c7aa..e426a92, 2f752a4)"
+  model_tiers: [haiku, sonnet, opus]
+  effort_levels: [low, medium, high, max]
+  validation_loops: [local, ci, corpus]
+  status_values: [ready, blocked, in_progress, done, revised, dropped]
+
+# ---------------------------------------------------------------------------
+# STAGE 0 — Measurement & attribution (gates everything; prompts pre-written)
+# ---------------------------------------------------------------------------
+tasks:
+  - id: S0.1
+    stage: 0
+    title: Inventory existing determinism machinery; produce gap report
+    agent: Scout
+    model: sonnet
+    effort: low
+    deps: []
+    validation: local
+    parallel_group: W0
+    status: ready
+    produces: [artefacts/stage-0/determinism-inventory.md]
+    done_when: >
+      Report lists every existing determinism mechanism (comparators, economic
+      collections, SOURCE_DATE_EPOCH handling, streaming/noEconomicSet markers,
+      object-file timestamp zeroing) with file:line, and every uncovered surface.
+    handback: inventory summary + ranked gap list
+
+  - id: S0.2
+    stage: 0
+    title: Design whole-image build-twice-and-diff harness (ADR)
+    agent: Architect
+    model: opus
+    effort: high
+    deps: [S0.1]
+    validation: local
+    parallel_group: W0
+    status: blocked
+    produces: [artefacts/stage-0/adr-harness.md]
+    done_when: >
+      ADR fixes the harness interfaces, the pipeline stage boundaries it captures,
+      and how it generalizes the existing mx llvm-backend-determinism-test.
+    handback: ADR decisions + stage-boundary list the harness will capture
+
+  - id: S0.3
+    stage: 0
+    title: Implement whole-image build-twice-and-diff harness
+    agent: Implementer
+    model: sonnet
+    effort: medium
+    deps: [S0.2]
+    validation: ci
+    parallel_group: W0
+    status: blocked
+    produces: [substratevm/mx.substratevm/mx_substratevm.py, ".github/workflows/native-image-determinism.yml"]
+    done_when: Two builds of a corpus app are auto-diffed end-to-end via one mx command.
+    handback: command name, flags, where diffs/artefacts land
+
+  - id: S0.4
+    stage: 0
+    title: Implement divergence classifier (stage x category attribution)
+    agent: Implementer
+    model: sonnet
+    effort: high
+    deps: [S0.3]
+    validation: ci
+    parallel_group: W0
+    status: blocked
+    produces: [artefacts/stage-0/classifier-report.example.md]
+    done_when: >
+      Every corpus divergence is auto-labelled with pipeline stage and category
+      (timestamp|path|order|id-renumber|offset-shift|address|other). Reuses the
+      whitelist/token approach from substratevm/docs/llvm-backend-determinism-classifier-spec.md.
+    handback: category taxonomy + per-stage divergence counts on the corpus
+
+  - id: S0.5
+    stage: 0
+    title: Assemble tiered test-app corpus
+    agent: Mechanic
+    model: sonnet
+    effort: low
+    deps: [S0.3]
+    validation: local
+    parallel_group: W0
+    status: blocked
+    produces: [substratevm/src/com.oracle.svm.test/determinism-corpus/]
+    done_when: ">=5 apps tiered by size (HelloWorld -> micro-service -> larger), wired into the harness."
+    handback: corpus manifest (app, size class, features exercised)
+
+  - id: S0.6
+    stage: 0
+    title: Reproducibility metric + trend tracking
+    agent: Implementer
+    model: sonnet
+    effort: medium
+    deps: [S0.4, S0.5]
+    validation: ci
+    parallel_group: W0
+    status: blocked
+    produces: [artefacts/stage-0/metric.md]
+    done_when: Per-app "% bytes / % functions reproducible" emitted and trended across commits.
+    handback: baseline metric values per corpus app
+
+  - id: S0.7a
+    stage: 0
+    title: Design stage checkpoint/replay (ADR)
+    agent: Architect
+    model: opus
+    effort: high
+    deps: [S0.2]
+    validation: local
+    parallel_group: W0
+    status: blocked
+    produces: [artefacts/stage-0/adr-checkpoint-replay.md]
+    done_when: >
+      ADR defines how to serialize the analysis result + universe so any downstream
+      stage can be replayed twice from identical input, isolating stage-local nondeterminism.
+    handback: serialization format, replay entry points, feasibility risks
+
+  - id: S0.7b
+    stage: 0
+    title: Implement stage checkpoint/replay
+    agent: Diagnostician
+    model: opus
+    effort: high
+    deps: [S0.7a]
+    validation: ci
+    parallel_group: W0
+    status: blocked
+    produces: [artefacts/stage-0/checkpoint-replay-notes.md]
+    done_when: A stage runs twice from one frozen input; any diff is provably stage-local.
+    handback: which stages are replayable, which are not yet, and why
+
+  # ----- Stage 0 review gate -----
+  - id: R0
+    stage: 0
+    kind: stage-gate-review
+    title: "Stage 0 gate: review learnings, revise plan, emit Stage 1 prompts"
+    agent: Architect
+    model: opus
+    effort: high
+    deps: [S0.1, S0.3, S0.4, S0.5, S0.6, S0.7b]
+    validation: local
+    status: blocked
+    produces:
+      - reviews/stage-0.review.md
+      - reviews/stage-0.review.yaml
+      - prompts/stage-1/
+    done_when: >
+      Review written; tasks.yaml stages 1+ revised from S0 findings; prompts/stage-1/*.md
+      generated, indexed, and schema-valid.
+
+# ---------------------------------------------------------------------------
+# STAGES 1..5 — placeholders. Tasks and prompts are written by the preceding
+# review gate (R0 writes Stage 1, R1 writes Stage 2, ...). The entries below are
+# intentionally minimal: they reserve ids and the review gates, and record the
+# *current best guess* of scope so the DAG is navigable. R<n-1> will replace each
+# stage's `tasks` with the revised, prompt-backed set.
+# ---------------------------------------------------------------------------
+
+stage_placeholders:
+  - stage: 1
+    name: Environment & input normalization
+    guess_tasks: [S1.1 SOURCE_DATE_EPOCH, S1.2 strip build paths, S1.3 locale/tz,
+                  S1.4 classpath order, S1.5 objfile timestamps, S1.6 per-fix gates]
+    written_by: R0
+    review_gate:
+      id: R1
+      agent: Architect
+      model: opus
+      effort: high
+      deps: [stage-1-tasks]
+      produces: [reviews/stage-1.review.md, reviews/stage-1.review.yaml, prompts/stage-2/]
+  - stage: 2
+    name: Build-time collection determinism
+    guess_tasks: [S2.1 audit unordered iteration, S2.2 triage, S2.3 fixes (batched),
+                  S2.4 lint rule, S2.5 verify tail under frozen input]
+    written_by: R1
+    review_gate:
+      id: R2
+      agent: Architect
+      model: opus
+      effort: high
+      deps: [stage-2-tasks]
+      produces: [reviews/stage-2.review.md, reviews/stage-2.review.yaml, prompts/stage-3/]
+  - stage: 3
+    name: Analysis reachability determinism (hard root)
+    guess_tasks: [S3.1 characterize wobble, S3.2 ref-build isolate parallelism,
+                  S3.3 worklist order, S3.4 saturation order, S3.5 callback order,
+                  S3.6 integrate+measure, S3.7 perf check]
+    written_by: R2
+    review_gate:
+      id: R3
+      agent: Architect
+      model: opus
+      effort: high
+      deps: [stage-3-tasks]
+      produces: [reviews/stage-3.review.md, reviews/stage-3.review.yaml, prompts/stage-4/]
+  - stage: 4
+    name: Per-backend codegen determinism
+    guess_tasks: [S4.1 fold LLVM gate+classifier, S4.2 default-backend audit,
+                  S4.3 default-backend fixes, S4.4 per-backend gates]
+    written_by: R3
+    review_gate:
+      id: R4
+      agent: Architect
+      model: opus
+      effort: high
+      deps: [stage-4-tasks]
+      produces: [reviews/stage-4.review.md, reviews/stage-4.review.yaml, prompts/stage-5/]
+  - stage: 5
+    name: Lock-in & productization
+    guess_tasks: [S5.1 contract+boundary ADR, S5.2 implement -H:+ReproducibleBuild,
+                  S5.3 per-stage CI gates, S5.4 user docs, S5.5 corpus x platform validation]
+    written_by: R4
+    review_gate:
+      id: R5
+      agent: Architect
+      model: opus
+      effort: high
+      deps: [stage-5-tasks]
+      produces: [reviews/stage-5.review.md, reviews/stage-5.review.yaml]
+      note: terminal retrospective; emits no next stage
+
+# ---------------------------------------------------------------------------
+# Execution waves (topological hint; the orchestrator derives the true ready
+# set from deps each tick).
+# ---------------------------------------------------------------------------
+waves:
+  W0: [S0.1, S0.2, S0.3, S0.4, S0.5, S0.6, S0.7a, S0.7b, R0]
+  W1: "Stage 1 + start of S3.1/S3.2 (written by R0/R2); quick wins + audits"
+  W2: "Stage 2 bulk fixes + S3.3-3.5 + S4.x audits"
+  W3: "Integrate + verify (S2.5, S3.6-3.7, S4.3-4.4)"
+  W4: "Lock-in (Stage 5)"
+
+critical_path: [S0.2, S0.3, S0.4, S0.7a, S0.7b, "S3.1", "S3.2", "S3.4", "S3.6", "S5.5"]
+notes:
+  - Stage 3 is the only max-effort cluster and the long pole; start S3.1 as soon as S0.7b lands.
+  - ~60% of tasks are sonnet and parallelizable; the scarce resource is the opus Diagnostician in Stage 3.

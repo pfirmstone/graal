@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graalvm.org/determinism/tasks.schema.json",
+  "title": "Native Image Reproducibility task DAG",
+  "type": "object",
+  "required": ["meta", "tasks"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["program", "version"],
+      "properties": {
+        "program": {"const": "native-image-reproducibility"},
+        "version": {"type": "integer"},
+        "created": {"type": "string"},
+        "origin": {"type": "string"},
+        "model_tiers": {"type": "array", "items": {"enum": ["haiku", "sonnet", "opus"]}},
+        "effort_levels": {"type": "array", "items": {"enum": ["low", "medium", "high", "max"]}},
+        "validation_loops": {"type": "array", "items": {"enum": ["local", "ci", "corpus"]}},
+        "status_values": {"type": "array"}
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/task"}
+    },
+    "stage_placeholders": {"type": "array"},
+    "waves": {"type": "object"},
+    "critical_path": {"type": "array"},
+    "notes": {"type": "array"}
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "required": ["id", "stage", "title", "agent", "model", "effort", "deps", "validation", "status"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^(S[0-5]\\.[0-9]+[a-z]?|R[0-5])$"},
+        "stage": {"type": "integer", "minimum": 0, "maximum": 5},
+        "kind": {"enum": ["task", "stage-gate-review"], "default": "task"},
+        "title": {"type": "string"},
+        "agent": {"enum": ["Scout", "Mechanic", "Implementer", "Infra", "Architect", "Diagnostician", "Reviewer"]},
+        "model": {"enum": ["haiku", "sonnet", "opus"]},
+        "effort": {"enum": ["low", "medium", "high", "max"]},
+        "deps": {"type": "array", "items": {"type": "string"}},
+        "validation": {"enum": ["local", "ci", "corpus"]},
+        "parallel_group": {"type": "string"},
+        "status": {"enum": ["ready", "blocked", "in_progress", "done", "revised", "dropped"]},
+        "produces": {"type": "array", "items": {"type": "string"}},
+        "done_when": {"type": "string"},
+        "handback": {"type": "string"}
+      },
+      "additionalProperties": true
+    }
+  }
+}

@@ -1,0 +1,47 @@
+# Stage-gate review (machine-readable). Schema: ../schema/review.schema.json
+# Filled in by the review gate R<stage>. Copy to stage-<stage>.review.yaml.
+stage: 0
+reviewed_at: "YYYY-MM-DD"
+summary: >
+  One paragraph: did the stage achieve its exit criteria, and what is now known
+  that was not known when the plan was written?
+
+decision: proceed        # proceed | replan | halt
+
+risks_discovered:
+  - risk: "..."
+    severity: medium     # low | medium | high | critical
+    mitigation: "..."
+
+# Edits applied to ../tasks.yaml. Never renumber an existing id; drop + add instead.
+plan_changes:
+  - op: modify           # add | modify | drop | reorder
+    target: S1.3
+    fields:
+      effort: high
+    rationale: "S0 found locale leakage is deeper than assumed."
+  - op: add
+    target: S1.7
+    fields:
+      stage: 1
+      title: "..."
+      agent: Implementer
+      model: sonnet
+      effort: medium
+      deps: [S1.2]
+      validation: ci
+      status: blocked
+    rationale: "New source discovered during S0.4 classification."
+  - op: drop
+    target: S1.5
+    rationale: "S0.1 inventory showed object-file timestamps already zeroed everywhere."
+
+# Prompt files generated for the next stage (each schema-valid per prompt.schema.json).
+next_stage_prompts:
+  - prompts/stage-1/S1.1.md
+  - prompts/stage-1/S1.2.md
+
+# Reproducibility metric at this gate (per corpus app, 0..1 = fraction reproducible).
+metric_snapshot:
+  helloworld: 0.0
+  microservice: 0.0

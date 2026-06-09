@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graalvm.org/determinism/prompt.schema.json",
+  "title": "Ready-to-dispatch agent prompt (YAML frontmatter)",
+  "description": "Schema for the YAML frontmatter block at the top of each prompts/stage-N/<id>.md file. The markdown body that follows is the cold-start prompt itself.",
+  "type": "object",
+  "required": ["id", "stage", "agent", "model", "effort", "deps", "validation", "produces", "done_when", "handback_to"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^(S[0-5]\\.[0-9]+[a-z]?|R[0-5])$"},
+    "stage": {"type": "integer", "minimum": 0, "maximum": 5},
+    "title": {"type": "string"},
+    "agent": {"enum": ["Scout", "Mechanic", "Implementer", "Infra", "Architect", "Diagnostician", "Reviewer"]},
+    "model": {"enum": ["haiku", "sonnet", "opus"]},
+    "effort": {"enum": ["low", "medium", "high", "max"]},
+    "deps": {"type": "array", "items": {"type": "string"}},
+    "validation": {"enum": ["local", "ci", "corpus"]},
+    "repo": {"type": "string", "description": "absolute or repo-relative root the agent operates in"},
+    "reads": {"type": "array", "items": {"type": "string"}, "description": "files the agent must read to gain context"},
+    "produces": {"type": "array", "items": {"type": "string"}},
+    "done_when": {"type": "string"},
+    "handback_to": {"type": "string", "description": "review gate id that consumes this task's handback, e.g. R0"},
+    "estimated_iterations": {"type": "integer"}
+  },
+  "additionalProperties": false
+}

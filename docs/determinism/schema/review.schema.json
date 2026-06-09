@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graalvm.org/determinism/review.schema.json",
+  "title": "Stage-gate review output + task handback",
+  "type": "object",
+  "required": ["stage", "decision", "plan_changes", "next_stage_prompts"],
+  "properties": {
+    "stage": {"type": "integer", "minimum": 0, "maximum": 5},
+    "reviewed_at": {"type": "string"},
+    "summary": {"type": "string"},
+    "decision": {"enum": ["proceed", "replan", "halt"]},
+    "risks_discovered": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["risk", "severity"],
+        "properties": {
+          "risk": {"type": "string"},
+          "severity": {"enum": ["low", "medium", "high", "critical"]},
+          "mitigation": {"type": "string"}
+        }
+      }
+    },
+    "plan_changes": {
+      "type": "array",
+      "description": "Ordered edits applied to tasks.yaml. Never renumber; drop+add instead.",
+      "items": {
+        "type": "object",
+        "required": ["op", "target", "rationale"],
+        "properties": {
+          "op": {"enum": ["add", "modify", "drop", "reorder"]},
+          "target": {"type": "string", "description": "task id"},
+          "fields": {"type": "object", "description": "for add/modify: the task fields"},
+          "rationale": {"type": "string"}
+        }
+      }
+    },
+    "next_stage_prompts": {
+      "type": "array",
+      "description": "prompt files generated for the next stage",
+      "items": {"type": "string"}
+    },
+    "metric_snapshot": {
+      "type": "object",
+      "description": "reproducibility metric at the gate, per corpus app",
+      "additionalProperties": {"type": "number"}
+    }
+  },
+  "$defs": {
+    "handback": {
+      "title": "Task handback (artefacts/handbacks/<id>.yaml)",
+      "type": "object",
+      "required": ["task", "status", "summary"],
+      "properties": {
+        "task": {"type": "string"},
+        "status": {"enum": ["done", "blocked", "partial"]},
+        "summary": {"type": "string", "description": "1-3 sentences for the review gate"},
+        "produced": {"type": "array", "items": {"type": "string"}},
+        "findings": {"type": "array", "items": {"type": "string"}, "description": "facts that may change the plan"},
+        "surprises": {"type": "array", "items": {"type": "string"}, "description": "things that broke an assumption"},
+        "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "suggested new/changed tasks"},
+        "blockers": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}
