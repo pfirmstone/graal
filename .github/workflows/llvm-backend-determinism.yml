@@ -217,5 +217,4 @@ jobs:
           path: |
             substratevm/mxbuild/**/svmbuild/llvm-backend-determinism-*/**
           if-no-files-found: warn
-          if-no-files-found: warn
           retention-days: 7
