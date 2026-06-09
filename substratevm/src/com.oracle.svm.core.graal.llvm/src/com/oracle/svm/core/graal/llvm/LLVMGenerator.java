@@ -1328,6 +1328,30 @@ public class LLVMGenerator extends CoreProvidersDelegate implements LIRGenerator
      * ({@code emitDeoptimize} throws), so no deopt-target method variants are
      * compiled, and every LLVM-compiled method is therefore present in
      * {@code getMethods()}.
+     *
+     * <h4>Why only implementation-invoked methods are indexed</h4>
+     *
+     * <p>{@code getMethods()} (the full reachable hosted universe) is
+     * <em>not</em> stable across builds: the reachability analysis includes a
+     * handful of reachable-but-never-executed methods whose membership wobbles
+     * between otherwise-identical builds (observed: 37612 vs 37567 methods, a
+     * 45-method delta, while the set of actually-compiled methods stayed a
+     * stable 9080).  Indexing over that wobbling set made every method's index
+     * -- and the stride {@code N} -- differ between builds, so every statepoint
+     * id shifted and 9079 of 9080 {@code f<n>.bc} files still diverged even
+     * after the id <em>scheme</em> was made correct.
+     *
+     * <p>The fix is to index over only
+     * {@code AnalysisMethod.isImplementationInvoked()}
+     * implementation-invoked methods -- those whose body "can ever be
+     * executed".  That predicate is a stable superset of the compiled set (the
+     * wobblers are non-executed reachable methods, which it excludes; every
+     * compiled method is executable, so it is included).  Ranking and the
+     * stride therefore depend only on the stable executable-method set, making
+     * statepoint ids reproducible.  A compiled method that is somehow not
+     * implementation-invoked would be absent from the map and trip the
+     * fail-loud guard in {@link #initialPatchpointIndexFor} rather than
+     * silently corrupting anything.
      */
 
     /**
@@ -1362,19 +1386,26 @@ public class LLVMGenerator extends CoreProvidersDelegate implements LIRGenerator
     private long patchpointLocalCounter;
 
     /**
-     * Assigns each method in {@code methods} a deterministic index in
-     * {@code [0, methods.size())}.  Must be invoked before any
+     * Assigns each implementation-invoked method in {@code methods} a
+     * deterministic index in {@code [0, count)}.  Must be invoked before any
      * {@link LLVMGenerator} is constructed.  Idempotent: a later call
      * overwrites the previous mapping (intended only for test harnesses that
      * reuse the JVM).
      *
-     * @param methods every method that will be compiled in this build; sorted
-     *                internally by {@link HostedMethod#getUniqueShortName()}
+     * <p>Only {@code AnalysisMethod.isImplementationInvoked()}
+     * implementation-invoked methods are indexed; see the class-level note on
+     * {@link #methodPatchpointIndices} for why the full reachable set is
+     * unstable and must not be used.
+     *
+     * @param methods every method in the hosted universe; filtered to the
+     *                implementation-invoked subset and sorted by
+     *                {@link HostedMethod#getUniqueShortName()}
      */
     public static void initializePatchpointIndices(Collection<? extends SharedMethod> methods) {
         List<HostedMethod> sorted = methods.stream()
                         .filter(m -> m instanceof HostedMethod)
                         .map(m -> (HostedMethod) m)
+                        .filter(m -> m.getWrapped().isImplementationInvoked())
                         .sorted(Comparator.comparing(HostedMethod::getUniqueShortName))
                         .collect(Collectors.toList());
         Map<HostedMethod, Integer> map = new HashMap<>(sorted.size() * 2);

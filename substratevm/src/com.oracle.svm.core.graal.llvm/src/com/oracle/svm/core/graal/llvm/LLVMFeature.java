@@ -141,11 +141,14 @@ public class LLVMFeature implements InternalFeature {
     @Override
     public void beforeCompilation(BeforeCompilationAccess access) {
         /*
-         * Pre-assign each HostedMethod a deterministic index so that the
-         * per-function LLVM bitcode is byte-identical across builds.  Call
-         * sites derive their patchpoint id as
-         * (methodIndex + localCounter * methodCount); see the long comment on
-         * LLVMGenerator.methodPatchpointIndices for the scheme and rationale.
+         * Pre-assign each implementation-invoked HostedMethod a deterministic
+         * index so that the per-function LLVM bitcode is byte-identical across
+         * builds.  Call sites derive their patchpoint id as
+         * (methodIndex + localCounter * invokedMethodCount); see the long
+         * comment on LLVMGenerator.methodPatchpointIndices for the scheme and
+         * why only implementation-invoked methods (a stable superset of the
+         * compiled set) are indexed -- the full reachable getMethods() set
+         * wobbles between builds and cannot be used.
          *
          * Before this hook existed, LLVMGenerator allocated patchpoint ids
          * from a single process-wide AtomicLong incremented from inside the
